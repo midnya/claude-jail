@@ -1,0 +1,19 @@
+services:
+  claude-jail:
+    image: claude-jail
+    build: .
+    environment:
+      CLAUDE_CODE_ENABLE_TELEMETRY: 0
+
+      COLORTERM: truecolor
+    volumes:
+      - type: bind
+        source: ${HOME}/.claude-jail
+        target: /home/claude/.claude
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOME}/.claude-jail.json
+        target: /home/claude/.claude.json
+        bind:
+          create_host_path: false

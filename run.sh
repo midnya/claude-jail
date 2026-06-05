@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-read_only=(
-    .git
-)
-
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <directory> <user> [docker compose args...]" >&2
     exit 1
@@ -35,27 +31,14 @@ claude_config_json="$HOME/.claude-jail-$JAIL_USER.json"
 mkdir -p "$claude_config_dir"
 [ -f "$claude_config_json" ] || echo '{}' > "$claude_config_json"
 
-override=""
-for path in "${read_only[@]}"; do
-    full="$JAIL_DIR/$path"
-    if [ -e "$full" ]; then
-        if [ -z "$override" ]; then
-            override="services:
-  claude-jail:
-    volumes:"
-        fi
-        override+="
-      - type: bind
-        source: $full
-        target: /workspace$JAIL_DIR/$path
-        read_only: true
-        bind:
-          create_host_path: false"
-    fi
-done
+command -v python3 >/dev/null 2>&1 || {
+    echo "Error: python3 is required to run $0" >&2
+    exit 1
+}
+override=$(python3 "$script_dir/build-mounts.py" "$JAIL_DIR" "$JAIL_DIR/.claude-jail.json") || exit 1
 
 if [ -n "$override" ]; then
-    exec docker compose -f "$script_dir/docker-compose.yml" -f <(echo "$override") "$@"
+    exec docker compose -f "$script_dir/docker-compose.yml" -f <(printf '%s\n' "$override") "$@"
 else
     exec docker compose -f "$script_dir/docker-compose.yml" "$@"
 fi

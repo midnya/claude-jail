@@ -17,6 +17,15 @@ don't try to work around them:
   `checkout`/`switch`, `tag`, `stash`, etc. The `.git` directory is mounted
   read-only, so these fail anyway. Read-only git commands (`status`, `log`,
   `diff`, `show`, `blame`) are fine.
+- **Some paths are mounted read-only.** Besides `.git`, the jail config file
+  `.claude-jail.json` and any paths it lists under `read_only` are bind-mounted
+  read-only. Writes to them fail at the filesystem level — don't try to edit,
+  move, or delete them. If a task seems to need it, report the limitation
+  instead.
+- **Some paths are hidden.** Paths listed under `hidden` in `.claude-jail.json`
+  are masked: the entry still shows up in directory listings, but its contents
+  read as empty (an empty dir, or an empty file). You can't see or recover the
+  real content — don't try, and don't treat the emptiness as data loss.
 - **Containerized filesystem.** Everything runs inside the container. Only the
   mounted working directory is the real project; changes elsewhere in the
   filesystem are ephemeral and lost when the container exits.

@@ -2,18 +2,37 @@ services:
   claude-jail:
     image: claude-jail
     build: .
+
     environment:
       CLAUDE_CODE_ENABLE_TELEMETRY: 0
-
+      CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: 1s
+      DISABLE_AUTOUPDATER: 1
       COLORTERM: truecolor
+
+      CLAUDE_APPEND_SYSTEM_PROMPT: ${CLAUDE_APPEND_SYSTEM_PROMPT:-}
     volumes:
       - type: bind
-        source: ${HOME}/.claude-jail
+        source: ${HOME}/.claude-jail-${JAIL_USER}
         target: /home/claude/.claude
         bind:
           create_host_path: false
       - type: bind
-        source: ${HOME}/.claude-jail.json
+        source: ${HOME}/.claude-jail-${JAIL_USER}.json
         target: /home/claude/.claude.json
         bind:
           create_host_path: false
+
+      - type: bind
+        source: ${JAIL_DIR}
+        target: /workspace${JAIL_DIR}
+        bind:
+          create_host_path: false
+
+      - type: volume
+        source: jail-tmp
+        target: /tmp
+    working_dir: /workspace${JAIL_DIR}
+
+volumes:
+  jail-tmp:
+    name: claude-jail-tmp-${JAIL_ID}

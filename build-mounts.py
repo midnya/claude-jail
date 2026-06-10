@@ -11,8 +11,10 @@ the config is malformed, a requested path is unsafe, or a hidden path is
 missing on the host.
 
 Hidden directories are masked with an empty read-only volume; hidden files with
-an empty compose config (a read-only volume can't mount over a single file).
-Both are empty and unwritable, and need no host-side scratch file.
+a read-only bind of /dev/null (a volume can't mount over a single file, and a
+compose config with empty content degrades into a bind of the client's cwd).
+Both read as empty and need no host-side scratch file; the file mask is a null
+device, so writes to it are silently discarded rather than refused.
 """
 import json
 import sys
@@ -111,16 +113,9 @@ def resolve(node: Node, parts: "list[str]", covered_ro: bool,
             resolve(node.children[name], parts + [name], covered_ro, out)
 
 
-# Name prefix for the compose configs that mask hidden files. Each hidden file
-# gets its own config, materialised by Docker from inline (empty) content and
-# bind-mounted read-only, so the file reads as a normal empty regular file.
-MASK_CONFIG = "claude-jail-empty-mask"
-
-
 def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
     """Render the resolved mounts as a docker compose override document."""
     volumes: "list[str]" = []
-    masked_files: "list[str]" = []
     for rel, mode in mounts:
         source = f"{jail_dir}/{rel}"
         target = f"/workspace{jail_dir}/{rel}"
@@ -158,27 +153,24 @@ def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
                 "          nocopy: true",
             ]
         else:
-            # A volume can't mount over a single file, so mask it with the
-            # empty compose config; it still reads as a normal empty file.
-            masked_files.append(tgt)
-    if not volumes and not masked_files:
-        return ""
-    config_names = [f"{MASK_CONFIG}-{i}" for i in range(len(masked_files))]
-    out: "list[str]" = ["services:", "  claude-jail:"]
-    if volumes:
-        out.append("    volumes:")
-        out += volumes
-    if masked_files:
-        out.append("    configs:")
-        for name, tgt in zip(config_names, masked_files):
-            out += [
-                f"      - source: {name}",
+            # A volume can't mount over a single file, so bind /dev/null over
+            # it; it reads as empty without a host-side scratch file. (A
+            # compose config with content: "" looks content-less to compose
+            # and degrades into a bind of the client's cwd.) Device nodes
+            # ignore read_only for writes, but those vanish into the null
+            # device, so the mask stays empty regardless.
+            volumes += [
+                "      - type: bind",
+                "        source: /dev/null",
                 f"        target: {tgt}",
+                "        read_only: true",
+                "        bind:",
+                "          create_host_path: false",
             ]
-    if config_names:
-        out.append("configs:")
-        for name in config_names:
-            out += [f"  {name}:", '    content: ""']
+    if not volumes:
+        return ""
+    out: "list[str]" = ["services:", "  claude-jail:", "    volumes:"]
+    out += volumes
     return "\n".join(out) + "\n"
 
 

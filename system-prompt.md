@@ -24,10 +24,9 @@ don't try to work around them:
   instead.
 - **Some paths are hidden.** Paths listed under `hidden` in `.claude-jail.json`
   are masked: the entry still shows up in directory listings, but its contents
-  read as empty (an empty dir, or a file that reads as empty — hidden files
-  appear as a null device, so writes to them are silently discarded). You can't
-  see or recover the real content — don't try, and don't treat the emptiness
-  as data loss.
+  read as empty (an empty dir, or a file masked by a read-only empty file, so
+  writes to it fail at the filesystem level). You can't see or recover the real
+  content — don't try, and don't treat the emptiness as data loss.
 - **Containerized filesystem.** Everything runs inside the container. Only the
   mounted working directory is the real project; changes elsewhere in the
   filesystem are ephemeral and lost when the container exits.

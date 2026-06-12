@@ -11,10 +11,12 @@ the config is malformed, a requested path is unsafe, or a hidden path is
 missing on the host.
 
 Hidden directories are masked with an empty read-only volume; hidden files with
-a read-only bind of /dev/null (a volume can't mount over a single file, and a
-compose config with empty content degrades into a bind of the client's cwd).
-Both read as empty and need no host-side scratch file; the file mask is a null
-device, so writes to it are silently discarded rather than refused.
+a read-only bind of an empty file shipped in the claude-jail repo (a volume
+can't mount over a single file). Both read as empty; because the file mask is a
+regular file on a read-only mount, writes to a hidden file are refused (EROFS)
+rather than silently discarded as they were when masked with /dev/null. The
+mask file lives outside the jail directory, so the sandboxed agent has no
+writable path to it and cannot un-empty the masks.
 """
 import json
 import sys
@@ -36,6 +38,13 @@ DEFAULTS = {
 # When one path is requested under several modes, the highest priority wins.
 # Hidden always trumps read_only.
 PRIORITY = {"read_only": 1, "hidden": 2}
+
+# Empty file, shipped in the claude-jail repo next to this script, that masks
+# every hidden file. A read-only bind of this regular file makes writes to a
+# hidden file fail with EROFS, instead of vanishing as they did when masked
+# with /dev/null. It lives outside the jail, so the agent cannot write to it.
+EMPTY_MASK = ".claude-jail-empty"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def die(msg: str) -> "None":
@@ -113,9 +122,30 @@ def resolve(node: Node, parts: "list[str]", covered_ro: bool,
             resolve(node.children[name], parts + [name], covered_ro, out)
 
 
+def ensure_empty_mask() -> None:
+    """Ensure the empty file that masks hidden files exists and is empty.
+
+    It is shipped in the claude-jail repo alongside this script; recreate it if
+    absent. Fail closed if something non-empty sits at that path, since using it
+    as the mask would leak its content into every hidden file.
+    """
+    path = SCRIPT_DIR / EMPTY_MASK
+    if path.exists():
+        if not path.is_file():
+            die(f"mask path exists but is not a regular file: {path}")
+        if path.stat().st_size != 0:
+            die(f"mask file must be empty: {path}")
+        return
+    try:
+        path.touch()
+    except OSError as e:
+        die(f"could not create mask file {path}: {e}")
+
+
 def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
     """Render the resolved mounts as a docker compose override document."""
     volumes: "list[str]" = []
+    need_empty = False
     for rel, mode in mounts:
         source = f"{jail_dir}/{rel}"
         target = f"/workspace{jail_dir}/{rel}"
@@ -153,15 +183,15 @@ def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
                 "          nocopy: true",
             ]
         else:
-            # A volume can't mount over a single file, so bind /dev/null over
-            # it; it reads as empty without a host-side scratch file. (A
-            # compose config with content: "" looks content-less to compose
-            # and degrades into a bind of the client's cwd.) Device nodes
-            # ignore read_only for writes, but those vanish into the null
-            # device, so the mask stays empty regardless.
+            # A volume can't mount over a single file, so bind an empty file
+            # (shipped in the claude-jail repo) over it. Being a regular file on
+            # a read-only mount, writes to a hidden file are refused with EROFS
+            # rather than silently swallowed the way /dev/null swallowed them.
+            need_empty = True
+            src = json.dumps(str(SCRIPT_DIR / EMPTY_MASK), ensure_ascii=False)
             volumes += [
                 "      - type: bind",
-                "        source: /dev/null",
+                f"        source: {src}",
                 f"        target: {tgt}",
                 "        read_only: true",
                 "        bind:",
@@ -169,6 +199,10 @@ def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
             ]
     if not volumes:
         return ""
+    if need_empty:
+        # The mask source must exist before compose runs (create_host_path is
+        # off). It sits outside the jail, so no in-container path can write it.
+        ensure_empty_mask()
     out: "list[str]" = ["services:", "  claude-jail:", "    volumes:"]
     out += volumes
     return "\n".join(out) + "\n"

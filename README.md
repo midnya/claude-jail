@@ -1,10 +1,10 @@
 # claude-jail
 
-Run Claude Code inside a locked-down Docker container.
-Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).
-Bug reports, feature requests, and PRs are most welcome.
+Run Claude Code inside a locked-down Docker container.  
+Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).  
+Bug reports, feature requests, and PRs are most welcome
 
-# Security model (so far)
+## Security model (so far)
 
 - Filesystem protection: bypasses Claude's sandbox feature and relies on Docker's instead.
     - For convenience, `/tmp` is a persisted volume that is shared per-workspace, between jail instances.
@@ -62,7 +62,7 @@ Available keys:
 - `read_only`: bind-mounted read-only. Visible inside the jail but writes
   fail at the filesystem level.
 - `hidden`: contents masked to empty. A hidden directory mounts as an empty
-  read-only volume; a hidden file reads as `/dev/null`.
+  read-only volume; a hidden file is masked with a read-only empty file.
 
 Notes:
 - `.git` and `.claude-jail.json` itself are always read-only.

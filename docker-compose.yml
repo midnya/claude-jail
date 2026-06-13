@@ -1,7 +1,13 @@
 services:
   claude-jail:
     image: claude-jail
-    build: .
+    build: ./docker/claude
+
+    networks:
+      - jail-internal
+    depends_on:
+      squid:
+        condition: service_healthy
 
     environment:
       CLAUDE_CODE_ENABLE_TELEMETRY: 0
@@ -10,6 +16,13 @@ services:
       COLORTERM: truecolor
 
       CLAUDE_APPEND_SYSTEM_PROMPT: ${CLAUDE_APPEND_SYSTEM_PROMPT:-}
+
+      HTTP_PROXY: http://squid:3128
+      HTTPS_PROXY: http://squid:3128
+      http_proxy: http://squid:3128
+      https_proxy: http://squid:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      no_proxy: localhost,127.0.0.1,::1
     volumes:
       - type: bind
         source: ${HOME}/.claude-jail-${JAIL_USER}
@@ -33,6 +46,30 @@ services:
         target: /tmp
     working_dir: /workspace${JAIL_DIR}
 
+  squid:
+    image: claude-jail-squid
+    build: ./docker/squid
+    networks:
+      - jail-internal
+      - jail-egress
+    volumes:
+      - type: volume
+        source: jail-squid-logs
+        target: /var/log/squid
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+networks:
+  jail-internal:
+    internal: true
+  jail-egress:
+
 volumes:
   jail-tmp:
     name: claude-jail-tmp-${JAIL_ID}
+  jail-squid-logs:
+    name: claude-jail-squid-logs-${JAIL_ID}

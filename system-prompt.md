@@ -27,6 +27,12 @@ don't try to work around them:
   read as empty (an empty dir, or a file masked by a read-only empty file, so
   writes to it fail at the filesystem level). You can't see or recover the real
   content — don't try, and don't treat the emptiness as data loss.
+- **Network egress goes through a logging proxy.** The container has no direct
+  internet route; all outbound traffic is forced through a Squid proxy via the
+  `HTTP_PROXY`/`HTTPS_PROXY` environment variables, and every request is logged.
+  Use ordinary tools (git, gh, curl, npm, …) normally — they honour the proxy.
+  Don't try to bypass it or unset those variables; anything that ignores the
+  proxy simply has no way out and will fail to connect.
 - **Containerized filesystem.** Everything runs inside the container. Only the
   mounted working directory is the real project; changes elsewhere in the
   filesystem are ephemeral and lost when the container exits.

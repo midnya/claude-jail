@@ -8,5 +8,4 @@ if [ -n "${CLAUDE_APPEND_SYSTEM_PROMPT:-}" ]; then
     args+=(--append-system-prompt "$CLAUDE_APPEND_SYSTEM_PROMPT")
 fi
 
-# Forward any extra args supplied on the `docker compose run ... claude-jail <args>` line.
 exec claude "${args[@]}" "$@"

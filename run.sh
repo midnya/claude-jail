@@ -20,6 +20,8 @@ export JAIL_ID=$(printf '%s' "${JAIL_DIR#/}" | sed 's|[^a-zA-Z0-9]\+|-|g')
 export JAIL_USER=$user
 script_dir=$(dirname "$(readlink -f "$0")")
 
+export COMPOSE_PROJECT_NAME=$(printf '%s' "$JAIL_ID" | tr '[:upper:]' '[:lower:]')
+
 prompt_file="$script_dir/system-prompt.md"
 if [ -z "${CLAUDE_APPEND_SYSTEM_PROMPT:-}" ] && [ -f "$prompt_file" ]; then
     CLAUDE_APPEND_SYSTEM_PROMPT=$(cat "$prompt_file")

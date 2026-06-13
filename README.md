@@ -2,13 +2,19 @@
 
 Run Claude Code inside a locked-down Docker container.  
 Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).  
-Bug reports, feature requests, and PRs are most welcome
+Bug reports, feature requests, and PRs are most welcome!
 
 ## Security model (so far)
 
 - Filesystem protection: bypasses Claude's sandbox feature and relies on Docker's instead.
-    - For convenience, `/tmp` is a persisted volume that is shared per-workspace, between jail instances.
-- Network isolation: nothing so far; the Docke container can be attached to user-defined networks.
+  - For convenience, `/tmp` is a persisted volume that is shared per-workspace,
+    between jail instances.
+- Network isolation: the jail container sits on an `internal` Docker network.
+  All egress is forced through a [Squid](https://www.squid-cache.org/)
+  proxy.
+ - (For now) the proxy applies no destination ACLs; it allows all requests
+    and logs them. The logs persist in a per-jail volume. Future work will
+    allow ACLs.
 
 ## Invocation
 
@@ -69,4 +75,3 @@ Notes:
 - Paths must be relative and stay inside the jail (no absolute paths, no `..`).
 - When a path is listed under both keys, `hidden` wins.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
-

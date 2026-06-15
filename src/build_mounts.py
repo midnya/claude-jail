@@ -4,12 +4,14 @@
 Usage: build_mounts.py <jail-dir> [config-file]
 
 Owns the filesystem keys of .claude-jail.json (read_only / hidden); the rest of
-the config is parsed by build_env.py. Combines the built-in mount policy with
-the config's path lists, resolves nesting and precedence into a mount tree
-(hidden always trumps read_only), and prints a docker compose override document
-to stdout. Prints nothing when there are no mounts. Exits non-zero with a
-message on stderr if the config is malformed, a requested path is unsafe, or a
-hidden path is missing on the host.
+the config is parsed by build_env.py and the shared helpers live in
+jail_config.py. Combines the built-in mount policy with the config's path lists,
+resolves nesting and precedence into a mount tree (hidden always trumps
+read_only), and prints a docker compose override document to stdout. Prints
+nothing when there are no mounts. Exits non-zero with a message on stderr if the
+config is malformed, a requested path is unsafe (absolute, contains `..`, or
+resolves outside the jail via a symlink), or a hidden path is missing on the
+host.
 
 Hidden directories are masked with an empty read-only volume; hidden files with
 a read-only bind of an empty file shipped in the claude-jail repo (a volume
@@ -22,6 +24,8 @@ writable path to it and cannot un-empty the masks.
 import json
 import sys
 from pathlib import Path, PurePosixPath
+
+from jail_config import die, read_config, resolve_in_jail
 
 # Top-level array keys recognised in .claude-jail.json. Each holds a list of
 # jail-relative paths.
@@ -48,22 +52,10 @@ EMPTY_MASK = ".claude-jail-empty"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def die(msg: str) -> "None":
-    sys.exit(f"Error: {msg}")
-
-
 def load_requested(config_file: "str | None") -> "dict[str, list[str]]":
     """Merge the built-in defaults with the config file's path lists."""
     requested = {key: list(DEFAULTS[key]) for key in KEYS}
-    if not config_file or not Path(config_file).is_file():
-        return requested
-
-    try:
-        data = json.loads(Path(config_file).read_text())
-    except json.JSONDecodeError as e:
-        die(f"invalid JSON in {config_file}: {e}")
-    if not isinstance(data, dict):
-        die(f"{config_file} must contain a JSON object")
+    data = read_config(config_file)
 
     for key in KEYS:
         entries = data.get(key, [])
@@ -148,6 +140,11 @@ def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
     volumes: "list[str]" = []
     need_empty = False
     for rel, mode in mounts:
+        # Refuse a path that escapes the jail via a symlink before we bind it;
+        # otherwise a `read_only` symlink could expose a host file to the agent
+        # and a `hidden` one could mask the wrong target. (Absolute / `..` were
+        # already rejected at parse time.)
+        resolve_in_jail(jail_dir, rel, f"{mode} path")
         source = f"{jail_dir}/{rel}"
         target = f"/workspace{jail_dir}/{rel}"
         host = Path(source)

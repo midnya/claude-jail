@@ -5,7 +5,8 @@ Usage: build_prompt.py <jail-dir> [config-file]
 
 build_mounts.py owns the filesystem keys and build_env.py the bare-word
 settings; this script owns the one free-text setting, system_prompt, since a
-multi-line prompt cannot ride build_env.py's NAME=value line protocol.
+multi-line prompt cannot ride build_env.py's NAME=value line protocol. The
+shared parsing/validation helpers live in jail_config.py.
 
 Reads the base jail prompt from stdin and looks for `system_prompt` in
 .claude-jail.json. A prompt is one or more segments, each either inline text or
@@ -21,30 +22,13 @@ object is shorthand for a single-segment list.
 Writes the merged prompt to stdout: the jail prompt, then the project prompt
 separated by a blank line. With no project prompt the base passes through
 unchanged. Exits non-zero on a malformed config, an unsafe path, or a missing
-prompt file.
+or empty prompt file.
 """
-import json
 import sys
-from pathlib import Path, PurePosixPath
+
+from jail_config import die, read_config, resolve_in_jail
 
 SETTING = "system_prompt"
-
-
-def die(msg: str) -> "None":
-    sys.exit(f"Error: {msg}")
-
-
-def read_config(config_file: "str | None") -> "dict":
-    """Read and JSON-parse the jail config, returning {} when absent."""
-    if not config_file or not Path(config_file).is_file():
-        return {}
-    try:
-        data = json.loads(Path(config_file).read_text())
-    except json.JSONDecodeError as e:
-        die(f"invalid JSON in {config_file}: {e}")
-    if not isinstance(data, dict):
-        die(f"{config_file} must contain a JSON object")
-    return data
 
 
 def resolve_segment(value: "object", jail_dir: str,
@@ -61,13 +45,13 @@ def resolve_segment(value: "object", jail_dir: str,
         rel = value["path"]
         if not isinstance(rel, str) or not rel:
             die(f"'{SETTING}.path' in {config_file} must be a non-empty string")
-        pp = PurePosixPath(rel)
-        if pp.is_absolute() or ".." in pp.parts:
-            die(f"'{SETTING}.path' must be relative to the jail: {rel}")
-        path = Path(jail_dir) / rel
+        path = resolve_in_jail(jail_dir, rel, f"'{SETTING}.path'")
         if not path.is_file():
             die(f"'{SETTING}.path' not found in the jail: {rel}")
-        return path.read_text()
+        text = path.read_text()
+        if not text.strip():
+            die(f"'{SETTING}.path' file is empty: {rel}")
+        return text
     die(f"'{SETTING}' segment in {config_file} must be a string or a "
         f'{{"path": ...}} object')
 
@@ -94,7 +78,7 @@ def user_prompt(data: "dict", jail_dir: str,
 def main() -> None:
     if not 2 <= len(sys.argv) <= 3:
         sys.exit(f"Usage: {sys.argv[0]} <jail-dir> [config-file]")
-    jail_dir = sys.argv[1].rstrip("/")
+    jail_dir = sys.argv[1].rstrip("/") or "/"
     config_file = sys.argv[2] if len(sys.argv) == 3 else None
 
     base = sys.stdin.read()

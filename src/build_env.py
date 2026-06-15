@@ -8,7 +8,8 @@ the rest of the config — the settings that shape how claude is launched. For
 each recognised setting present it prints one NAME=value line to stdout, which
 run.sh exports and docker-compose.yml forwards into the container. Prints
 nothing when no such setting is present. Exits non-zero with a message on
-stderr if the config is malformed or a value is invalid.
+stderr if the config is malformed or a value is invalid. Shared
+parsing/validation helpers live in jail_config.py.
 
 Settings:
   default_mode -> CLAUDE_JAIL_PERMISSION_MODE
@@ -18,32 +19,9 @@ Settings:
       check it is a bare word — both to keep this decoupled from claude's list
       and so the value is safe to export and interpolate without quoting.
 """
-import json
-import re
 import sys
-from pathlib import Path
 
-# A value safe to place after NAME= in a shell export and to pass through a
-# docker-compose ${VAR} interpolation: a bare word with no whitespace, quotes,
-# or other metacharacters that could break out of the assignment.
-BARE_WORD = re.compile(r"\A[A-Za-z][A-Za-z0-9_-]*\Z")
-
-
-def die(msg: str) -> "None":
-    sys.exit(f"Error: {msg}")
-
-
-def read_config(config_file: "str | None") -> "dict":
-    """Read and JSON-parse the jail config, returning {} when absent."""
-    if not config_file or not Path(config_file).is_file():
-        return {}
-    try:
-        data = json.loads(Path(config_file).read_text())
-    except json.JSONDecodeError as e:
-        die(f"invalid JSON in {config_file}: {e}")
-    if not isinstance(data, dict):
-        die(f"{config_file} must contain a JSON object")
-    return data
+from jail_config import BARE_WORD, die, read_config
 
 
 def default_mode(data: "dict", config_file: "str | None") -> "str | None":

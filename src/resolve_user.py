@@ -6,42 +6,21 @@ Usage: resolve_user.py <config-file> [override]
 The user names a per-identity config namespace: Claude's config and credentials
 persist on the host in ~/.claude-jail-<user>/ and ~/.claude-jail-<user>.json, so
 different names keep separate logins. It comes from the --user flag (passed here
-as <override>) or the "user" key in .claude-jail.json; the flag wins. An empty
-override means the flag was absent. run.sh interpolates the result into those
-host paths and into docker-compose's ${JAIL_USER}, so the value is restricted to
-a bare word with no whitespace, quotes, or path separators.
+as <override>) or the "user" key in .claude-jail.json; the flag wins. A missing
+<override> means the flag was absent — run.sh rejects an explicit empty --user
+before it gets here, so an empty override never reaches this script. run.sh
+interpolates the result into those host paths and into docker-compose's
+${JAIL_USER}, so the value is restricted to a bare word with no whitespace,
+quotes, or path separators. Shared helpers live in jail_config.py.
 
 Prints the resolved user to stdout. Exits non-zero with a message on stderr if
 the config is malformed, the value is invalid, or neither source supplies one.
 """
-import json
-import re
 import sys
-from pathlib import Path
+
+from jail_config import BARE_WORD, die, read_config
 
 SETTING = "user"
-
-# A value safe to interpolate into a host path (~/.claude-jail-<user>) and a
-# docker-compose ${JAIL_USER} substitution: a bare word, no whitespace, quotes,
-# path separators, or other metacharacters. Matches build_env.py's rule.
-BARE_WORD = re.compile(r"\A[A-Za-z][A-Za-z0-9_-]*\Z")
-
-
-def die(msg: str) -> "None":
-    sys.exit(f"Error: {msg}")
-
-
-def read_config(config_file: "str | None") -> "dict":
-    """Read and JSON-parse the jail config, returning {} when absent."""
-    if not config_file or not Path(config_file).is_file():
-        return {}
-    try:
-        data = json.loads(Path(config_file).read_text())
-    except json.JSONDecodeError as e:
-        die(f"invalid JSON in {config_file}: {e}")
-    if not isinstance(data, dict):
-        die(f"{config_file} must contain a JSON object")
-    return data
 
 
 def resolve(data: "dict", override: "str | None",

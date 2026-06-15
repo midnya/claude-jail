@@ -4,6 +4,10 @@ Run Claude Code inside a locked-down Docker container.
 Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).  
 Bug reports, feature requests, and PRs are most welcome!
 
+## AI usage disclosure
+
+`claude-jail` has partly been built with `Claude` itself. Its .git has always been quarantined.
+
 ## Security model (so far)
 
 - Filesystem protection: bypasses Claude's sandbox feature and relies on Docker's instead.
@@ -90,10 +94,10 @@ Available keys:
     `"system_prompt": ["Prefer pnpm over npm.", { "path": "CLAUDE_PROMPT.md" }]`
 
 Notes:
-- `user` must be a bare word (a letter, then letters/digits/`-`/`_`).
+- `user` must be a bare word (a letter, then letters/digits/`-`/`_`.
 - `.git` and `.claude-jail.json` itself are always read-only.
-- Paths must be relative and stay inside the jail (no absolute paths, no `..`).
+- Paths must be relative and stay inside the jail.
 - When a path is listed under both keys, `hidden` wins.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
-- A missing `system_prompt.path` file is a hard error.
+- A missing or empty `system_prompt.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.

@@ -1,15 +1,16 @@
-#!/usr/bin/env python3
-"""Shared helpers for the claude-jail config parsers (the src/ scripts).
+"""Shared helpers for the claude-jail config parsers (the src/ modules).
 
-run.sh drives several small scripts that each read .claude-jail.json for their
-own slice of it — build_mounts.py (read_only / hidden), build_env.py
-(default_mode), build_prompt.py (system_prompt) and resolve_user.py (user).
-This module is their single source of truth for the things they must agree on:
-how errors are reported, how the config is read and shape-checked, what counts
-as a shell-/compose-safe bare word, and how a jail-relative path is resolved
-without letting it escape the jail (including via symlinks).
+claude-jail reads .claude-jail.json once and hands the parsed data to several
+small modules that each interpret their own slice of it — build_mounts.py
+(read_only / hidden), build_env.py (default_mode), build_prompt.py
+(system_prompt) and resolve_user.py (user). This module is their single source
+of truth for the things they must agree on: how errors are reported, how the
+config is read and shape-checked, what counts as a shell-/compose-safe bare
+word, and how a jail-relative path is resolved without letting it escape the
+jail (including via symlinks).
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path, PurePosixPath
@@ -28,12 +29,12 @@ def die(msg: str) -> "None":
     sys.exit(f"Error: {msg}")
 
 
-def read_config(config_file: "str | None") -> "dict":
+def read_config(config_file: str) -> "dict":
     """Read and JSON-parse the jail config, returning {} when absent."""
-    if not config_file or not Path(config_file).is_file():
+    if not Path(config_file).is_file():
         return {}
     try:
-        data = json.loads(Path(config_file).read_text())
+        data = json.loads(Path(config_file).read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         die(f"invalid JSON in {config_file}: {e}")
     if not isinstance(data, dict):
@@ -41,12 +42,17 @@ def read_config(config_file: "str | None") -> "dict":
     return data
 
 
+def _inside_jail(jail_root: Path, target: Path) -> bool:
+    """True when `target` is the jail root itself or sits beneath it."""
+    return target == jail_root or jail_root in target.parents
+
+
 def resolve_in_jail(jail_dir: str, rel: str, what: str) -> Path:
     """Resolve a jail-relative path, refusing to escape the jail.
 
     Rejects absolute paths and `..` components up front, then resolves symlinks
     and confirms the real target stays inside the (real) jail directory — so an
-    in-jail symlink cannot point run.sh at a host file outside the jail (e.g. a
+    in-jail symlink cannot point claude-jail at a host file outside the jail (e.g. a
     `system_prompt.path` or `read_only` entry pointing at ~/.ssh/id_rsa). On any
     violation it calls die(); otherwise it returns the resolved Path.
 
@@ -57,6 +63,33 @@ def resolve_in_jail(jail_dir: str, rel: str, what: str) -> Path:
         die(f"{what} must be relative to the jail: {rel}")
     jail_root = Path(jail_dir).resolve()
     target = (jail_root / rel).resolve()
-    if target != jail_root and jail_root not in target.parents:
+    if not _inside_jail(jail_root, target):
         die(f"{what} escapes the jail (resolves outside it): {rel}")
     return target
+
+
+def relpath_in_jail(jail_dir: str, path: str) -> "str | None":
+    """Where `path` really sits relative to the jail, or None when external.
+
+    Classifies by the *resolved* location, not the spelled one: a config whose
+    real path is inside the jail is agent-writable and must be masked and have
+    its prompt files confined, even when reached through a symlink that lexically
+    points elsewhere (e.g. `-c /link/.claude-jail.json` with /link -> the jail,
+    or a relative -c resolved against a CWD outside the jail). A config whose
+    real path is outside the jail is unreachable from the container, so this
+    returns None and nothing is mounted for it.
+
+    The one hard error is a path that lexically *names* something inside the jail
+    but escapes through a symlink: the agent controls that in-jail symlink and
+    could otherwise dodge the mask that hides the active config, so it dies
+    loudly. A not-yet-created path still resolves by name, so this works for a
+    config file the caller may point anywhere with -c.
+    """
+    jail_root = Path(jail_dir).resolve()
+    real = Path(path).resolve()
+    if _inside_jail(jail_root, real):
+        rel = str(real.relative_to(jail_root))
+        return None if rel == "." else rel
+    if _inside_jail(jail_root, Path(os.path.abspath(path))):
+        die(f"config file escapes the jail (resolves outside it): {path}")
+    return None

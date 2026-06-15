@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Launch Claude Code inside the claude-jail Docker sandbox.
+
+    claude-jail [--user NAME] [--config PATH] <directory> [docker compose args...]
+
+Options before <directory> are ours; <directory> is the jail; everything after
+it is forwarded to `docker compose`. Config parsing lives in the src/ modules
+(resolve_user, build_prompt, build_env, build_mounts, jail_config), imported and
+called in-process; their die() raises SystemExit, so a bad config aborts before
+any host state is touched.
+
+The generated mount override is never written to disk: it reaches
+`docker compose -f` through an in-memory pipe exposed as /dev/fd/N (the shell's
+`<(...)`), so the jail's mount policy can't be read off disk or tampered with.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "src"))
+
+import build_env
+import build_mounts
+import build_prompt
+import resolve_user
+from jail_config import die, read_config, relpath_in_jail
+
+COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
+PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
+
+
+def parse_args(argv: "list[str]") -> argparse.Namespace:
+    """Parse the invocation.
+
+    Forwards everything after <directory> to docker compose untouched,
+    including flags like --rm or --help meant for the container.
+    """
+    parser = argparse.ArgumentParser(
+        allow_abbrev=False,
+        description="Launch Claude Code inside the claude-jail Docker sandbox.",
+        usage="%(prog)s [--user NAME] [--config PATH] <directory> "
+              "[docker compose args...]",
+    )
+    parser.add_argument(
+        "-u", "--user", metavar="NAME",
+        help='config namespace, overriding the "user" key in the config file '
+             "(one of the two must be set); config and credentials persist on "
+             "the host in ~/.claude-jail-<name>/ and ~/.claude-jail-<name>.json",
+    )
+    parser.add_argument(
+        "-c", "--config", metavar="PATH",
+        help="jail config file (default: <directory>/.claude-jail.json)",
+    )
+    parser.add_argument(
+        "directory",
+        help="path to jail; bind-mounted read-write at /workspace/<directory>",
+    )
+    parser.add_argument(
+        "compose_args", nargs=argparse.REMAINDER, metavar="...",
+        help="forwarded verbatim to docker compose",
+    )
+    args = parser.parse_args(argv)
+    if args.user == "":
+        parser.error("--user requires a non-empty value")
+    if args.config == "":
+        parser.error("--config requires a non-empty value")
+    return args
+
+
+def _feed_pipe(fd: int, data: bytes) -> None:
+    try:
+        os.write(fd, data)
+    except BrokenPipeError:
+        pass  # docker closed the override pipe before reading it all
+    finally:
+        os.close(fd)
+
+
+def run_compose(base_cmd: "list[str]", compose_args: "list[str]",
+                override: str) -> int:
+    """Run `docker compose`, feeding the mount override via an in-memory pipe.
+
+    pass_fds keeps the pipe's read end open and CLOEXEC-cleared across the exec,
+    so /dev/fd/N is inherited by docker and the compose plugin it spawns (as the
+    shell's process-substitution fd was). The writer thread avoids a deadlock if
+    the override outgrows the pipe buffer.
+    """
+    if not override:
+        return subprocess.run([*base_cmd, *compose_args]).returncode
+    read_fd, write_fd = os.pipe()
+    writer = threading.Thread(target=_feed_pipe,
+                              args=(write_fd, override.encode()),
+                              daemon=True)
+    writer.start()
+    try:
+        cmd = [*base_cmd, "-f", f"/dev/fd/{read_fd}", *compose_args]
+        return subprocess.run(cmd, pass_fds=(read_fd,)).returncode
+    finally:
+        # docker has exited, so closing our read end unblocks the writer with
+        # EPIPE at once in the normal case. The bounded join (plus the daemon
+        # flag) covers the rare case where a leaked descendant still holds the
+        # read end open and the override is larger than the pipe buffer, so we
+        # never wait forever on bytes docker no longer needs.
+        os.close(read_fd)
+        writer.join(timeout=5)
+
+
+def cleanup_side_containers(base_cmd: "list[str]", project: str) -> None:
+    """Tear side containers down, but only when no other live session shares this project.
+
+    Concurrent runs of the same directory share side services (e.g. squid), so reference-count
+    the live claude-jail containers and only `down` when none remain; err toward
+    leaving it up if the count fails. `down` needs only the base compose file.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q",
+             "--filter", f"label=com.docker.compose.project={project}",
+             "--filter", "label=com.docker.compose.service=claude-jail"],
+            capture_output=True, text=True,
+        )
+        # Tear down only when the count succeeded and found no live sessions;
+        # a failed count leaves the side services up.
+        last_session = result.returncode == 0 and not result.stdout.strip()
+    except OSError:
+        last_session = False
+    if last_session:
+        subprocess.run([*base_cmd, "down", "--timeout", "0"])
+
+
+def require_docker_compose() -> None:
+    """Abort unless the docker CLI and its v2 compose plugin are both present.
+
+    One call proves both: an OSError means docker itself is absent, a non-zero
+    return means the plugin is (we drive `docker compose`, not the legacy
+    standalone docker-compose binary).
+    """
+    try:
+        ok = subprocess.run(["docker", "compose", "version"],
+                            capture_output=True).returncode == 0
+    except OSError:
+        die("docker not found on PATH")
+    if not ok:
+        die("docker compose plugin not found "
+            "(the legacy standalone docker-compose binary is not supported)")
+
+
+# docker compose global flags that consume the following token as their value;
+# every other token starting with "-" is a valueless global flag. Used to find
+# the subcommand even when global flags precede it (e.g. `--progress plain run`).
+_COMPOSE_VALUE_FLAGS = frozenset({
+    "-f", "--file", "-p", "--project-name", "--profile", "--env-file",
+    "--ansi", "--progress", "--project-directory", "--parallel",
+})
+
+
+def compose_subcommand(compose_args: "list[str]") -> "str | None":
+    """The docker compose subcommand, skipping any leading global flags."""
+    i = 0
+    while i < len(compose_args):
+        tok = compose_args[i]
+        if not tok.startswith("-"):
+            return tok
+        if tok in _COMPOSE_VALUE_FLAGS:  # `--flag=value` self-contains its value
+            i += 1
+        i += 1
+    return None
+
+
+def jail_identity(directory: str) -> "tuple[str, str, str]":
+    """Resolve the jail dir and derive its id and compose project name.
+
+    realpath always yields an absolute path; stripping the slashes and
+    slugifying gives the id, falling back to "root" so even jailing "/" produces
+    a valid, non-empty compose project name and volume suffix.
+    """
+    jail_dir = os.path.realpath(directory)
+    jail_id = re.sub(r"[^A-Za-z0-9]+", "-", jail_dir.strip("/")) or "root"
+    return jail_dir, jail_id, jail_id.lower()
+
+
+def build_jail(user_flag: "str | None", identity: "tuple[str, str, str]",
+               config_path: str) -> "tuple[str, dict, str]":
+    """Validate the config and assemble the launch environment and mount override.
+
+    `identity` is jail_identity()'s (jail_dir, jail_id, project) bundle, the
+    single source of the slug relationship. Runs entirely before any host state
+    is touched, so a bad config aborts via die() here. Returns (jail_user,
+    environment, override).
+    """
+    jail_dir, jail_id, project = identity
+    data = read_config(config_path)
+    jail_user = resolve_user.resolve(data, user_flag, config_path)
+    config_rel = relpath_in_jail(jail_dir, config_path)
+    prompt = build_prompt.merge(PROMPT_FILE.read_text(encoding="utf-8"), data,
+                                jail_dir,
+                                config_path, config_rel)
+    environment = {
+        "JAIL_DIR": jail_dir,
+        "JAIL_ID": jail_id,
+        "JAIL_USER": jail_user,
+        "COMPOSE_PROJECT_NAME": project,
+        "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
+        **build_env.exports(data, config_path),
+    }
+    override = build_mounts.override(data, jail_dir, config_path, config_rel)
+    return jail_user, environment, override
+
+
+def ensure_user_config(home: Path, jail_user: str) -> None:
+    """Create the per-user config dir/file on the host if they don't exist."""
+    config_dir = home / f".claude-jail-{jail_user}"
+    config_file = home / f".claude-jail-{jail_user}.json"
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        if not config_file.exists():
+            config_file.write_text("{}\n")
+    except OSError as e:
+        die(f"could not create the per-user config in {home}: {e}")
+
+
+def main() -> None:
+    args = parse_args(sys.argv[1:])
+    require_docker_compose()
+    if not os.path.isdir(args.directory):
+        die(f"'{args.directory}' is not a directory")
+    if not PROMPT_FILE.is_file():
+        die(f"base system prompt not found: {PROMPT_FILE}")
+
+    identity = jail_identity(args.directory)
+    jail_dir, _, project = identity
+    config_path = args.config or f"{jail_dir}/.claude-jail.json"
+    jail_user, environment, override = build_jail(args.user, identity, config_path)
+
+    # Config is valid; now apply the env and create host state.
+    os.environ.update(environment)
+    home_env = os.environ.get("HOME")
+    if not home_env:
+        die("HOME is not set; cannot locate the per-user config directory")
+    ensure_user_config(Path(home_env), jail_user)
+    if build_mounts.needs_empty_mask(override):
+        build_mounts.ensure_empty_mask()
+
+    base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
+    status = run_compose(base_cmd, args.compose_args, override)
+    if compose_subcommand(args.compose_args) == "run":
+        cleanup_side_containers(base_cmd, project)
+    sys.exit(status)
+
+
+if __name__ == "__main__":
+    main()

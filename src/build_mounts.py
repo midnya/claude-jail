@@ -1,17 +1,13 @@
-#!/usr/bin/env python3
 """Build the docker compose override (volumes) for a claude-jail run.
-
-Usage: build_mounts.py <jail-dir> [config-file]
 
 Owns the filesystem keys of .claude-jail.json (read_only / hidden); the rest of
 the config is parsed by build_env.py and the shared helpers live in
-jail_config.py. Combines the built-in mount policy with the config's path lists,
-resolves nesting and precedence into a mount tree (hidden always trumps
-read_only), and prints a docker compose override document to stdout. Prints
-nothing when there are no mounts. Exits non-zero with a message on stderr if the
-config is malformed, a requested path is unsafe (absolute, contains `..`, or
-resolves outside the jail via a symlink), or a hidden path is missing on the
-host.
+jail_config.py. override() combines the built-in mount policy with the config's
+path lists, resolves nesting and precedence into a mount tree (hidden always
+trumps read_only), and returns a docker compose override document (empty when
+there are no mounts). Exits non-zero with a message on stderr if the config is
+malformed, a requested path is unsafe (absolute, contains `..`, or resolves
+outside the jail via a symlink), or a hidden path is missing on the host.
 
 Hidden directories are masked with an empty read-only volume; hidden files with
 a read-only bind of an empty file shipped in the claude-jail repo (a volume
@@ -22,10 +18,9 @@ mask file lives outside the jail directory, so the sandboxed agent has no
 writable path to it and cannot un-empty the masks.
 """
 import json
-import sys
 from pathlib import Path, PurePosixPath
 
-from jail_config import die, read_config, resolve_in_jail
+from jail_config import die, resolve_in_jail
 
 # Top-level array keys recognised in .claude-jail.json. Each holds a list of
 # jail-relative paths.
@@ -33,10 +28,10 @@ from jail_config import die, read_config, resolve_in_jail
 #   hidden    — content masked (empty) inside the container.
 KEYS = ("read_only", "hidden")
 
-# Built-in policy applied to every jail. The config file itself is protected so
-# the sandboxed agent cannot rewrite its own jail rules.
+# Built-in policy applied to every jail. The active config file is hidden at
+# runtime when it lives inside the jail (see load_requested).
 DEFAULTS = {
-    "read_only": [".git", ".claude-jail.json"],
+    "read_only": [".git"],
     "hidden": [],
 }
 
@@ -52,10 +47,20 @@ EMPTY_MASK = ".claude-jail-empty"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def load_requested(config_file: "str | None") -> "dict[str, list[str]]":
-    """Merge the built-in defaults with the config file's path lists."""
+def load_requested(data: "dict", config_file: str,
+                   config_rel: "str | None") -> "dict[str, list[str]]":
+    """Merge the built-in defaults with the config's path lists.
+
+    The active config file is hidden (masked empty, unwritable) when it lives
+    inside the jail, so the sandboxed agent can neither read nor rewrite its own
+    jail rules — wherever -c placed it, not just the conventional
+    .claude-jail.json. `config_rel` is its jail-relative path (None when the
+    config is external, see relpath_in_jail). A config that doesn't exist on the
+    host is skipped, since hiding a missing path is otherwise a hard error.
+    """
     requested = {key: list(DEFAULTS[key]) for key in KEYS}
-    data = read_config(config_file)
+    if config_rel is not None and Path(config_file).is_file():
+        requested["hidden"].append(config_rel)
 
     for key in KEYS:
         entries = data.get(key, [])
@@ -136,9 +141,13 @@ def ensure_empty_mask() -> None:
 
 
 def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
-    """Render the resolved mounts as a docker compose override document."""
+    """Render the resolved mounts as a docker compose override document.
+
+    Side-effect-free: when the result binds the empty mask (a hidden file is
+    present, see needs_empty_mask) the caller must ensure_empty_mask() before
+    compose runs, keeping host writes out of the validation step.
+    """
     volumes: "list[str]" = []
-    need_empty = False
     for rel, mode in mounts:
         # Refuse a path that escapes the jail via a symlink before we bind it;
         # otherwise a `read_only` symlink could expose a host file to the agent
@@ -185,7 +194,6 @@ def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
             # (shipped in the claude-jail repo) over it. Being a regular file on
             # a read-only mount, writes to a hidden file are refused with EROFS
             # rather than silently swallowed the way /dev/null swallowed them.
-            need_empty = True
             src = json.dumps(str(SCRIPT_DIR / EMPTY_MASK), ensure_ascii=False)
             volumes += [
                 "      - type: bind",
@@ -197,27 +205,25 @@ def render(mounts: "list[tuple[str, str]]", jail_dir: str) -> str:
             ]
     if not volumes:
         return ""
-    if need_empty:
-        # The mask source must exist before compose runs (create_host_path is
-        # off). It sits outside the jail, so no in-container path can write it.
-        ensure_empty_mask()
     out: "list[str]" = ["services:", "  claude-jail:", "    volumes:"]
     out += volumes
     return "\n".join(out) + "\n"
 
 
-def main() -> None:
-    if not 2 <= len(sys.argv) <= 3:
-        sys.exit(f"Usage: {sys.argv[0]} <jail-dir> [config-file]")
-    jail_dir = sys.argv[1].rstrip("/")
-    config_file = sys.argv[2] if len(sys.argv) == 3 else None
+def needs_empty_mask(override: str) -> bool:
+    """True when the override binds the empty mask (a hidden file is present).
 
-    requested = load_requested(config_file)
+    The launcher checks this in its launch phase to create the mask (the only
+    host write build_mounts performs) only once the config is fully validated.
+    """
+    return EMPTY_MASK in override
+
+
+def override(data: "dict", jail_dir: str, config_file: str,
+             config_rel: "str | None") -> str:
+    """Build the docker compose volume override; "" when there are no mounts."""
+    requested = load_requested(data, config_file, config_rel)
     tree = build_tree(requested)
     mounts: "list[tuple[str, str]]" = []
     resolve(tree, [], False, mounts)
-    sys.stdout.write(render(mounts, jail_dir))
-
-
-if __name__ == "__main__":
-    main()
+    return render(mounts, jail_dir)

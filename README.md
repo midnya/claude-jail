@@ -21,13 +21,13 @@ Bug reports, feature requests, and PRs are most welcome!
 Everything goes through `run.sh`:
 
 ```sh
-./run.sh <directory> <user> [docker compose args...]
+./run.sh [--user <name>] <directory> [docker compose args...]
 ```
 
+- `--user <name>` (`-u`): a config namespace. Claude's config and credentials
+  persist on the host in `~/.claude-jail-<name>/` and `~/.claude-jail-<name>.json`,
+  created on first run. Use different names to keep separate identities/logins.
 - `<directory>`: the path to jail; bind-mounted in read-write at `/workspace/<directory>`.
-- `<user>`: a config namespace. Claude's config and credentials persist on
-  the host in `~/.claude-jail-<user>/` and `~/.claude-jail-<user>.json`, created
-  on first run. Use different names to keep separate identities/logins.
 - `[docker compose args...]`: forwarded verbatim to `docker compose`.
 
 ## Commands
@@ -35,20 +35,26 @@ Everything goes through `run.sh`:
 Build the image (needed once, or when you wish to update the claude package):
 
 ```sh
-./run.sh ~/code/myproject me build --no-cache
+./run.sh --user me ~/code/myproject build --no-cache
 ```
 
 Start an interactive session:
 
 ```sh
-./run.sh ~/code/myproject me run --rm claude-jail
+./run.sh --user me ~/code/myproject run --rm claude-jail
 ```
 
 Any extra args after the service name are passed straight through to `claude`:
 
 ```sh
-./run.sh ~/code/myproject me run --rm claude-jail --help
-./run.sh ~/code/myproject me run --rm claude-jail -p "summarize this repo"
+./run.sh --user me ~/code/myproject run --rm claude-jail --help
+./run.sh --user me ~/code/myproject run --rm claude-jail -p "summarize this repo"
+```
+
+With a `user` key set in `.claude-jail.json`, the `--user` flag can be omitted:
+
+```sh
+./run.sh ~/code/myproject run --rm claude-jail
 ```
 
 ## Configuration
@@ -59,6 +65,7 @@ Example:
 
 ```json
 {
+  "user": "me",
   "read_only": ["config/secrets.yml", "production/"],
   "hidden": [".env", "private/notes"],
   "default_mode": "plan",
@@ -67,6 +74,7 @@ Example:
 ```
 
 Available keys:
+- `user`: the config namespace. The `--user` flag overrides it; one of the two must be set.
 - `read_only`: bind-mounted read-only. Visible inside the jail but writes
   fail at the filesystem level.
 - `hidden`: contents masked to empty. A hidden directory mounts as an empty
@@ -80,6 +88,7 @@ Available keys:
   - file: `"system_prompt": { "path": "CLAUDE_PROMPT.md" }`
 
 Notes:
+- `user` must be a bare word (a letter, then letters/digits/`-`/`_`).
 - `.git` and `.claude-jail.json` itself are always read-only.
 - Paths must be relative and stay inside the jail (no absolute paths, no `..`).
 - When a path is listed under both keys, `hidden` wins.

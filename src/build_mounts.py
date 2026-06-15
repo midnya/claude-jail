@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Build the docker compose override (volumes + configs) for a claude-jail run.
+"""Build the docker compose override (volumes) for a claude-jail run.
 
-Usage: build-mounts.py <jail-dir> [config-file]
+Usage: build_mounts.py <jail-dir> [config-file]
 
-Combines the built-in mount policy with an optional .claude-jail.json config,
-resolves nesting and precedence into a mount tree (hidden always trumps
-read_only), and prints a docker compose override document to stdout. Prints
-nothing when there are no mounts. Exits non-zero with a message on stderr if
-the config is malformed, a requested path is unsafe, or a hidden path is
-missing on the host.
+Owns the filesystem keys of .claude-jail.json (read_only / hidden); the rest of
+the config is parsed by build_env.py. Combines the built-in mount policy with
+the config's path lists, resolves nesting and precedence into a mount tree
+(hidden always trumps read_only), and prints a docker compose override document
+to stdout. Prints nothing when there are no mounts. Exits non-zero with a
+message on stderr if the config is malformed, a requested path is unsafe, or a
+hidden path is missing on the host.
 
 Hidden directories are masked with an empty read-only volume; hidden files with
 a read-only bind of an empty file shipped in the claude-jail repo (a volume

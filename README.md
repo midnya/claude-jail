@@ -60,7 +60,9 @@ Example:
 ```json
 {
   "read_only": ["config/secrets.yml", "production/"],
-  "hidden": [".env", "private/notes"]
+  "hidden": [".env", "private/notes"],
+  "default_mode": "plan",
+  "system_prompt": { "path": "CLAUDE_JAIL_PROMPT.md" }
 }
 ```
 
@@ -69,9 +71,18 @@ Available keys:
   fail at the filesystem level.
 - `hidden`: contents masked to empty. A hidden directory mounts as an empty
   read-only volume; a hidden file is masked with a read-only empty file.
+- `default_mode`: the permission mode Claude starts in, forwarded to
+  `claude --permission-mode`.
+- `system_prompt`: an extra system prompt, appended to the jail's built-in one
+  (it adds to the sandbox prompt, it does not replace it). Either inline text
+  or a jail-relative file:
+  - inline: `"system_prompt": "Prefer pnpm over npm in this repo."`
+  - file: `"system_prompt": { "path": "CLAUDE_PROMPT.md" }`
 
 Notes:
 - `.git` and `.claude-jail.json` itself are always read-only.
 - Paths must be relative and stay inside the jail (no absolute paths, no `..`).
 - When a path is listed under both keys, `hidden` wins.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
+- A missing `system_prompt.path` file is a hard error.
+- An explicit `--permission-mode` on the command line wins.

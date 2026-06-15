@@ -22,12 +22,6 @@ script_dir=$(dirname "$(readlink -f "$0")")
 
 export COMPOSE_PROJECT_NAME=$(printf '%s' "$JAIL_ID" | tr '[:upper:]' '[:lower:]')
 
-prompt_file="$script_dir/system-prompt.md"
-if [ -z "${CLAUDE_APPEND_SYSTEM_PROMPT:-}" ] && [ -f "$prompt_file" ]; then
-    CLAUDE_APPEND_SYSTEM_PROMPT=$(cat "$prompt_file")
-fi
-export CLAUDE_APPEND_SYSTEM_PROMPT="${CLAUDE_APPEND_SYSTEM_PROMPT:-}"
-
 claude_config_dir="$HOME/.claude-jail-$JAIL_USER"
 claude_config_json="$HOME/.claude-jail-$JAIL_USER.json"
 mkdir -p "$claude_config_dir"
@@ -37,10 +31,40 @@ command -v python3 >/dev/null 2>&1 || {
     echo "Error: python3 is required to run $0" >&2
     exit 1
 }
-override=$(python3 "$script_dir/build-mounts.py" "$JAIL_DIR" "$JAIL_DIR/.claude-jail.json") || exit 1
 
-if [ -n "$override" ]; then
-    exec docker compose -f "$script_dir/docker-compose.yml" -f <(printf '%s\n' "$override") "$@"
-else
-    exec docker compose -f "$script_dir/docker-compose.yml" "$@"
+config_json="$JAIL_DIR/.claude-jail.json"
+
+prompt_file="$script_dir/system-prompt.md"
+[ -f "$prompt_file" ] || prompt_file=/dev/null
+CLAUDE_APPEND_SYSTEM_PROMPT=$(
+    python3 "$script_dir/src/build_prompt.py" "$JAIL_DIR" "$config_json" < "$prompt_file"
+) || exit 1
+export CLAUDE_APPEND_SYSTEM_PROMPT
+
+env_exports=$(python3 "$script_dir/src/build_env.py" "$config_json") || exit 1
+if [ -n "$env_exports" ]; then
+    while IFS= read -r assignment; do
+        export "$assignment"
+    done <<< "$env_exports"
 fi
+
+override=$(python3 "$script_dir/src/build_mounts.py" "$JAIL_DIR" "$config_json") || exit 1
+
+base=(docker compose -f "$script_dir/docker-compose.yml")
+
+status=0
+if [ -n "$override" ]; then
+    "${base[@]}" -f <(printf '%s\n' "$override") "$@" || status=$?
+else
+    "${base[@]}" "$@" || status=$?
+fi
+
+# Side containers cleanup if this was the last instance at the time of exit.
+if [ "${1:-}" = run ]; then
+    others=$(docker ps -q \
+        --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+        --filter "label=com.docker.compose.service=claude-jail") || others=keep
+    [ -z "$others" ] && { "${base[@]}" down || true; }
+fi
+
+exit "$status"

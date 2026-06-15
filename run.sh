@@ -64,7 +64,7 @@ if [ "${1:-}" = run ]; then
     others=$(docker ps -q \
         --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
         --filter "label=com.docker.compose.service=claude-jail") || others=keep
-    [ -z "$others" ] && { "${base[@]}" down || true; }
+    [ -z "$others" ] && { "${base[@]}" down --timeout 0 || true; }
 fi
 
 exit "$status"

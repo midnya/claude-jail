@@ -8,10 +8,15 @@ settings; this script owns the one free-text setting, system_prompt, since a
 multi-line prompt cannot ride build_env.py's NAME=value line protocol.
 
 Reads the base jail prompt from stdin and looks for `system_prompt` in
-.claude-jail.json:
+.claude-jail.json. A prompt is one or more segments, each either inline text or
+a jail-relative file:
 
     "system_prompt": "inline text..."          # used verbatim
     "system_prompt": {"path": "path/to.md"}    # read from a jail-relative file
+    "system_prompt": ["intro...", {"path": "more.md"}]   # segments joined
+
+A list's segments are joined with a blank line, in order; a bare string or
+object is shorthand for a single-segment list.
 
 Writes the merged prompt to stdout: the jail prompt, then the project prompt
 separated by a blank line. With no project prompt the base passes through
@@ -42,15 +47,12 @@ def read_config(config_file: "str | None") -> "dict":
     return data
 
 
-def user_prompt(data: "dict", jail_dir: str,
-                config_file: "str | None") -> "str | None":
-    """Resolve the project-supplied prompt text, or None when unset."""
-    value = data.get(SETTING)
-    if value is None:
-        return None
+def resolve_segment(value: "object", jail_dir: str,
+                    config_file: "str | None") -> str:
+    """Resolve one prompt segment (inline string or {"path": ...}) to text."""
     if isinstance(value, str):
         if not value.strip():
-            die(f"'{SETTING}' in {config_file} must not be empty")
+            die(f"'{SETTING}' segment in {config_file} must not be empty")
         return value
     if isinstance(value, dict):
         if set(value) != {"path"}:
@@ -66,8 +68,27 @@ def user_prompt(data: "dict", jail_dir: str,
         if not path.is_file():
             die(f"'{SETTING}.path' not found in the jail: {rel}")
         return path.read_text()
-    die(f"'{SETTING}' in {config_file} must be a string or a "
+    die(f"'{SETTING}' segment in {config_file} must be a string or a "
         f'{{"path": ...}} object')
+
+
+def user_prompt(data: "dict", jail_dir: str,
+                config_file: "str | None") -> "str | None":
+    """Resolve the project-supplied prompt text, or None when unset.
+
+    `system_prompt` may be a single segment (an inline string or a
+    {"path": ...} object) or a list of such segments joined with a blank line.
+    """
+    value = data.get(SETTING)
+    if value is None:
+        return None
+    if isinstance(value, list):
+        segments = [resolve_segment(v, jail_dir, config_file) for v in value]
+        return "\n\n".join(segments)
+    if isinstance(value, (str, dict)):
+        return resolve_segment(value, jail_dir, config_file)
+    die(f"'{SETTING}' in {config_file} must be a string, a "
+        f'{{"path": ...}} object, or a list of these')
 
 
 def main() -> None:

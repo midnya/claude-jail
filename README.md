@@ -82,10 +82,12 @@ Available keys:
 - `default_mode`: the permission mode Claude starts in, forwarded to
   `claude --permission-mode`.
 - `system_prompt`: an extra system prompt, appended to the jail's built-in one
-  (it adds to the sandbox prompt, it does not replace it). Either inline text
-  or a jail-relative file:
+  (it adds to the sandbox prompt, it does not replace it). A segment is either
+  inline text or a jail-relative file, and you may pass one or a list of them:
   - inline: `"system_prompt": "Prefer pnpm over npm in this repo."`
   - file: `"system_prompt": { "path": "CLAUDE_PROMPT.md" }`
+  - list (segments joined with a blank line, in order):
+    `"system_prompt": ["Prefer pnpm over npm.", { "path": "CLAUDE_PROMPT.md" }]`
 
 Notes:
 - `user` must be a bare word (a letter, then letters/digits/`-`/`_`).

@@ -17,24 +17,25 @@ don't try to work around them:
   `checkout`/`switch`, `tag`, `stash`, etc. The `.git` directory is mounted
   read-only, so these fail anyway. Read-only git commands (`status`, `log`,
   `diff`, `show`, `blame`) are fine.
-- **Some paths are mounted read-only.** Besides `.git`, the jail config file
-  `.claude-jail.json` and any paths it lists under `read_only` are bind-mounted
-  read-only. Writes to them fail at the filesystem level — don't try to edit,
-  move, or delete them. If a task seems to need it, report the limitation
-  instead.
-- **Some paths are hidden.** Paths listed under `hidden` in `.claude-jail.json`
-  are masked: the entry still shows up in directory listings, but its contents
-  read as empty (an empty dir, or a file masked by a read-only empty file, so
-  writes to it fail at the filesystem level). You can't see or recover the real
-  content — don't try, and don't treat the emptiness as data loss.
-- **Network egress goes through a logging proxy.** The container has no direct
-  internet route; all outbound traffic is forced through a Squid proxy via the
+- **Some paths are mounted read-only.** Besides each root's `.git`, any paths
+  the jail config lists under a root's `read_only` are bind-mounted read-only.
+  Writes to them fail at the filesystem level — don't try to edit, move, or
+  delete them. If a task seems to need it, report the limitation instead.
+- **Some paths are hidden.** Paths the jail config lists under a root's `hidden`
+  (and the jail's own config file) are masked: the entry still shows up in
+  directory listings, but its contents read as empty (an empty dir, or a file
+  masked by a read-only empty file, so writes to it fail at the filesystem
+  level). You can't see or recover the real content — don't try, and don't treat
+  the emptiness as data loss.
+- **Network egress goes through a proxy.** The container has no direct internet route;
+  all outbound traffic is forced through a Squid proxy via the
   `HTTP_PROXY`/`HTTPS_PROXY` environment variables, and every request is logged.
   Use ordinary tools (git, gh, curl, npm, …) normally — they honour the proxy.
   Don't try to bypass it or unset those variables; anything that ignores the
   proxy simply has no way out and will fail to connect.
-- **Containerized filesystem.** Everything runs inside the container. Only the
-  mounted working directory is the real project; changes elsewhere in the
+- **Containerized filesystem.** Everything runs inside the container. Your
+  working directory is `/workspace`; only the project roots mounted beneath it
+  (listed under "Project roots" below) are real. Changes elsewhere in the
   filesystem are ephemeral and lost when the container exits.
 - **`/tmp` persists across runs.** `/tmp` is kept between container invocations,
   so use it as durable scratch space — cache downloads, build artifacts,

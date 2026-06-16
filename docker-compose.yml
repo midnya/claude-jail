@@ -36,16 +36,10 @@ services:
         bind:
           create_host_path: false
 
-      - type: bind
-        source: ${JAIL_DIR}
-        target: /workspace${JAIL_DIR}
-        bind:
-          create_host_path: false
-
       - type: volume
         source: jail-tmp
         target: /tmp
-    working_dir: /workspace${JAIL_DIR}
+    working_dir: /workspace
 
   squid:
     image: claude-jail-squid

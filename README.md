@@ -25,67 +25,83 @@ Still in active development; bug reports, feature requests, and PRs are most wel
 Everything goes through `claude-jail`:
 
 ```sh
-./claude-jail [--user <name>] [--config <path>] <directory> [docker compose args...]
+claude-jail [--user <name>] [--config <path>] [docker compose args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
   persist on the host in `~/.claude-jail-<name>/` and `~/.claude-jail-<name>.json`,
   created on first run. Use different names to keep separate identities/logins.
 - `--config <path>` (`-c`): the jail config file. Defaults to
-  `<directory>/.claude-jail.json`.
-- `<directory>`: the path to jail; bind-mounted in read-write at `/workspace/<directory>`.
-- `[docker compose args...]`: forwarded verbatim to `docker compose`.
+  `./.claude-jail.json`.
+- `[docker compose args...]`: forwarded verbatim to `docker compose`. Use `--` to explicitely pass the rest of the command to compose.
 
 ## Commands
+
+Run from the directory that holds your `.claude-jail.json` (or point `-c` at it).
 
 Build the image (needed once, or when you wish to update the claude package):
 
 ```sh
-./claude-jail --user me ~/code/myproject build --no-cache
+cd ~/code/myproject
+claude-jail --user me build --no-cache
 ```
 
 Start an interactive session:
 
 ```sh
-./claude-jail --user me ~/code/myproject run --rm claude-jail
+claude-jail --user me run --rm claude-jail
 ```
 
 Any extra args after the service name are passed straight through to `claude`:
 
 ```sh
-./claude-jail --user me ~/code/myproject run --rm claude-jail --help
-./claude-jail --user me ~/code/myproject run --rm claude-jail -p "summarize this repo"
+claude-jail --user me run --rm claude-jail --help
+claude-jail --user me run --rm claude-jail -p "summarize this repo"
 ```
 
-With a `user` key set in `.claude-jail.json`, the `--user` flag can be omitted:
+With a `user` key set in the config, the `--user` flag can be omitted.
+
+`-c` lets you launch from anywhere:
 
 ```sh
-./claude-jail ~/code/myproject run --rm claude-jail
+claude-jail -c ~/code/myproject/.claude-jail.json run --rm claude-jail
 ```
 
 ## Configuration
 
-Config lives in `.claude-jail.json` at the root of the jailed project, or
-wherever you point `--config` (`-c`).
+It defines the jail's **roots**, the directories
+bind-mounted read-write, each with its own filesystem rules.
 
 Example:
 
 ```json
 {
   "user": "me",
-  "read_only": ["config/secrets.yml", "production/"],
-  "hidden": [".env", "private/notes"],
   "default_mode": "plan",
-  "system_prompt": { "path": "CLAUDE_JAIL_PROMPT.md" }
+  "system_prompt": { "path": "CLAUDE_JAIL_PROMPT.md" },
+  "roots": [
+    {
+      "path": ".",
+      "read_only": ["config/secrets.yml", "production/"],
+      "hidden": [".env", "private/notes"]
+    },
+    "../shared-lib"
+  ]
 }
 ```
 
 Available keys:
 - `user`: the config namespace. The `--user` flag overrides it; one of the two must be set.
-- `read_only`: bind-mounted read-only. Visible inside the jail but writes
-  fail at the filesystem level.
-- `hidden`: contents masked to empty. A hidden directory mounts as an empty
-  read-only volume; a hidden file is masked with a read-only empty file.
+- `roots`: the directories to jail, each bind-mounted read-write at
+  `/workspace/<abs path>`. A list whose entries are either a string path or an
+  object `{ "path", "read_only", "hidden" }`. A relative `path` is resolved
+  against the config file's directory; an absolute one is taken as-is. Omit
+  `roots` to jail the config file's own directory.
+  - `read_only` (per root): paths relative to that root, bind-mounted read-only.
+    Visible inside the jail but writes fail at the filesystem level.
+  - `hidden` (per root): paths relative to that root, masked to empty. A hidden
+    directory mounts as an empty read-only volume; a hidden file is masked with
+    a read-only empty file.
 - `default_mode`: the permission mode Claude starts in, forwarded to
   `claude --permission-mode`.
 - `system_prompt`: an extra system prompt, appended to the jail's built-in one.
@@ -95,23 +111,22 @@ Available keys:
   - list (segments joined with a blank line, in order):
     `"system_prompt": ["Prefer pnpm over npm.", { "path": "CLAUDE_PROMPT.md" }]`
 
-
-
 Notes:
 - `user` must be a bare word (a letter, then letters/digits/`-`/`_`).
-- `.git` is always read-only.
-- An active config file inside the jail (the default `.claude-jail.json`, or a
-  `--config` path under the jail) is hidden inside the container.
-- A `--config` path outside the jail is never mounted at all; the agent
-  doesn't see it.
-- A path that names something inside the jail but escapes via a
-  symlink is a hard error.
-- A `path` file is read on the host at launch (its text is injected into the
-  prompt, never mounted). For a config inside the jail the path is jail-relative
-  and must stay inside the jail; for a `--config` outside the jail it is read
-  relative to that config file and may live anywhere.
-- Paths must be relative and stay inside the jail.
-- When a path is listed under both keys, `hidden` wins.
+- `.git` in every root is always read-only.
+- Each root must be an existing directory; roots may not be nested in or
+  duplicate one another, nor be the filesystem root `/` or your home directory.
+- `.claude-jail.json` in every root is hidden inside the container,
+  including the active config wherever it sits, even if it doesn't exist yet.
+- A config path that names something inside a root but escapes via a symlink is
+  a hard error.
+- A `system_prompt.path` file is read on the host at launch (its text is
+  injected into the prompt, never mounted), relative to the config file's
+  directory. The read never follows a symlink. For a config inside the
+  jail the file must resolve inside some root; for a config outside
+  the jail it is trusted and may live anywhere.
+- Per-root `read_only`/`hidden` paths must be relative and stay inside their
+  root. When a path is listed under both, `hidden` wins.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
 - A missing or empty `system_prompt.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.

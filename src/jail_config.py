@@ -2,12 +2,17 @@
 
 claude-jail reads .claude-jail.json once and hands the parsed data to several
 small modules that each interpret their own slice of it — build_mounts.py
-(read_only / hidden), build_env.py (default_mode), build_prompt.py
+(roots / read_only / hidden), build_env.py (default_mode), build_prompt.py
 (system_prompt) and resolve_user.py (user). This module is their single source
 of truth for the things they must agree on: how errors are reported, how the
 config is read and shape-checked, what counts as a shell-/compose-safe bare
-word, and how a jail-relative path is resolved without letting it escape the
-jail (including via symlinks).
+word, what the jail's roots are, and how a path is resolved without letting it
+escape those roots (including via symlinks).
+
+The config is anchored on the config file, not a CLI directory: `roots` lists
+the directories bind-mounted into the jail (each with its own read_only/hidden
+rules), defaulting to the directory containing the config file when absent. A
+root `path` is resolved relative to that directory.
 """
 import json
 import os
@@ -23,6 +28,9 @@ from pathlib import Path, PurePosixPath
 # them.
 BARE_WORD = re.compile(r"\A[A-Za-z][A-Za-z0-9_-]*\Z")
 
+# Keys recognised inside a `roots` entry object.
+ROOT_KEYS = {"path", "read_only", "hidden"}
+
 
 def die(msg: str) -> "None":
     """Print 'Error: <msg>' to stderr and exit non-zero."""
@@ -34,7 +42,11 @@ def read_config(config_file: str) -> "dict":
     if not Path(config_file).is_file():
         return {}
     try:
-        data = json.loads(Path(config_file).read_text(encoding="utf-8"))
+        text = Path(config_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        die(f"could not read {config_file}: {e}")
+    try:
+        data = json.loads(text)
     except json.JSONDecodeError as e:
         die(f"invalid JSON in {config_file}: {e}")
     if not isinstance(data, dict):
@@ -42,54 +54,183 @@ def read_config(config_file: str) -> "dict":
     return data
 
 
-def _inside_jail(jail_root: Path, target: Path) -> bool:
-    """True when `target` is the jail root itself or sits beneath it."""
-    return target == jail_root or jail_root in target.parents
+class Root:
+    """A jail root: a host directory and its per-root read_only/hidden lists.
+
+    `dir` is the resolved (realpath) absolute directory; `read_only` and
+    `hidden` are the raw, root-relative path lists from the config (validated
+    and expanded with the built-in defaults by build_mounts.py).
+    """
+    __slots__ = ("dir", "read_only", "hidden")
+
+    def __init__(self, dir: str, read_only: "list", hidden: "list") -> None:
+        self.dir = dir
+        self.read_only = read_only
+        self.hidden = hidden
 
 
-def resolve_in_jail(jail_dir: str, rel: str, what: str) -> Path:
-    """Resolve a jail-relative path, refusing to escape the jail.
+def _inside(root: Path, target: Path) -> bool:
+    """True when `target` is `root` itself or sits beneath it."""
+    return target == root or root in target.parents
+
+
+def _forbidden_root(root_dir: str) -> bool:
+    """True for a root too broad to jail: the filesystem root or $HOME.
+
+    Either would bind-mount the whole tree (host secrets, the per-user
+    credential dirs) read-write into the sandbox, defeating the jail.
+    """
+    if root_dir == os.sep:
+        return True
+    home = os.environ.get("HOME")
+    return bool(home) and root_dir == os.path.realpath(home)
+
+
+def _key_list(entry: "dict", key: str, config_file: str) -> "list":
+    """A roots-entry list value (read_only / hidden); [] when absent."""
+    value = entry.get(key, [])
+    if not isinstance(value, list):
+        die(f"'roots[].{key}' in {config_file} must be a list")
+    return value
+
+
+def parse_roots(data: "dict", config_file: str) -> "list[Root]":
+    """Resolve the jail roots from the config.
+
+    `roots` is a list whose entries are either a bare string (shorthand for
+    {"path": ...}) or an object with `path` and optional `read_only`/`hidden`.
+    A relative `path` is resolved against the directory containing the config
+    file; an absolute one is taken as-is; both are realpath'd. When `roots` is
+    absent the single root is the config file's own directory. Each root must be
+    an existing directory, and roots may not be nested in or duplicate one
+    another (overlapping bind mounts). Calls die() on any violation.
+    """
+    config_dir = str(Path(config_file).resolve().parent)
+    entries = data.get("roots")
+    if entries is None:
+        entries = ["."]
+    elif not isinstance(entries, list):
+        die(f"'roots' in {config_file} must be a list")
+    elif not entries:
+        die(f"'roots' in {config_file} must not be empty")
+
+    roots: "list[Root]" = []
+    for entry in entries:
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        if not isinstance(entry, dict):
+            die(f"each 'roots' entry in {config_file} must be a string or "
+                f"a {{\"path\": ...}} object")
+        unknown = set(entry) - ROOT_KEYS
+        if unknown:
+            die(f"unknown key(s) in a 'roots' entry in {config_file}: "
+                f"{sorted(unknown)}")
+        path = entry.get("path")
+        if not isinstance(path, str) or not path:
+            die(f"'roots[].path' in {config_file} must be a non-empty string")
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(config_dir) / path
+        root_dir = os.path.realpath(p)
+        if not os.path.isdir(root_dir):
+            die(f"root path is not a directory: {path}")
+        if _forbidden_root(root_dir):
+            die(f"a jail root may not be the filesystem root or your home "
+                f"directory: {path}")
+        for other in roots:
+            if (root_dir == other.dir
+                    or _inside(Path(root_dir), Path(other.dir))
+                    or _inside(Path(other.dir), Path(root_dir))):
+                die(f"roots overlap (nested or duplicate): {path}")
+        roots.append(Root(
+            root_dir,
+            _key_list(entry, "read_only", config_file),
+            _key_list(entry, "hidden", config_file),
+        ))
+    return roots
+
+
+def resolve_in_root(root_dir: str, rel: str, what: str) -> Path:
+    """Resolve a root-relative path, refusing to escape that root.
 
     Rejects absolute paths and `..` components up front, then resolves symlinks
-    and confirms the real target stays inside the (real) jail directory — so an
-    in-jail symlink cannot point claude-jail at a host file outside the jail (e.g. a
-    `system_prompt.path` or `read_only` entry pointing at ~/.ssh/id_rsa). On any
-    violation it calls die(); otherwise it returns the resolved Path.
-
-    `what` names the setting for error messages, e.g. "'system_prompt.path'".
+    and confirms the real target stays inside the (real) root — so an in-jail
+    symlink cannot point claude-jail at a host file outside the root (e.g. a
+    `read_only` entry pointing at ~/.ssh/id_rsa). On any violation it calls
+    die(); otherwise it returns the resolved Path. `what` names the setting for
+    error messages, e.g. "read_only path".
     """
     pp = PurePosixPath(rel)
     if pp.is_absolute() or ".." in pp.parts:
-        die(f"{what} must be relative to the jail: {rel}")
-    jail_root = Path(jail_dir).resolve()
-    target = (jail_root / rel).resolve()
-    if not _inside_jail(jail_root, target):
-        die(f"{what} escapes the jail (resolves outside it): {rel}")
+        die(f"{what} must be relative to its root: {rel}")
+    # root_dir is already an os.path.realpath result, so Path(root_dir) is
+    # canonical and needs no further .resolve().
+    root = Path(root_dir)
+    target = (root / rel).resolve()
+    if not _inside(root, target):
+        die(f"{what} escapes its root (resolves outside it): {rel}")
     return target
 
 
-def relpath_in_jail(jail_dir: str, path: str) -> "str | None":
-    """Where `path` really sits relative to the jail, or None when external.
+def safe_host_path(base_dir: str, rel: str, roots: "list[Root]",
+                   trusted: bool, what: str) -> Path:
+    """Resolve a host file to read at launch, refusing any agent redirect.
+
+    The file's bytes are read on the host and injected into the agent's prompt,
+    so the agent — which controls every byte inside a jail root — must not be
+    able to point the read at a file it could not itself read. We walk `rel`
+    one component at a time from the trusted, already-resolved `base_dir` (the
+    config file's directory) and refuse to traverse a symlink: a planted
+    symlink (e.g. doc.md -> a hidden file, or -> a host secret outside the jail)
+    is the whole attack, so following one is never safe here.
+
+    For an in-jail config (`trusted` False) the resolved file must additionally
+    land inside some root. For an external, user-owned config (`trusted` True)
+    the file may live anywhere and an absolute `rel` is taken as-is. Calls die()
+    on a symlink in the path or, when untrusted, a target outside every root.
+    """
+    pp = PurePosixPath(rel)
+    if pp.is_absolute():
+        cur, parts = Path(pp.anchor), pp.parts[1:]
+    else:
+        cur, parts = Path(base_dir), pp.parts
+    for part in parts:
+        if part == "..":
+            cur = cur.parent
+            continue
+        cur = cur / part
+        if cur.is_symlink():
+            die(f"{what} must not traverse a symlink: {rel}")
+    if not trusted and not any(_inside(Path(r.dir), cur) for r in roots):
+        die(f"{what} escapes the jail (resolves outside every root): {rel}")
+    return cur
+
+
+def classify_config(roots: "list[Root]",
+                    config_path: str) -> "tuple[str, str] | None":
+    """Locate the active config within the roots: (root_dir, rel) or None.
 
     Classifies by the *resolved* location, not the spelled one: a config whose
-    real path is inside the jail is agent-writable and must be masked and have
-    its prompt files confined, even when reached through a symlink that lexically
-    points elsewhere (e.g. `-c /link/.claude-jail.json` with /link -> the jail,
-    or a relative -c resolved against a CWD outside the jail). A config whose
-    real path is outside the jail is unreachable from the container, so this
-    returns None and nothing is mounted for it.
+    real path is inside a root is agent-writable and must be masked there (and
+    have its prompt files confined), even when reached through a symlink that
+    lexically points elsewhere. A config whose real path is outside every root
+    is unreachable from the container, so this returns None and nothing is
+    mounted for it.
 
-    The one hard error is a path that lexically *names* something inside the jail
-    but escapes through a symlink: the agent controls that in-jail symlink and
+    The one hard error is a path that lexically *names* something inside a root
+    but escapes through a symlink: the agent controls that in-root symlink and
     could otherwise dodge the mask that hides the active config, so it dies
-    loudly. A not-yet-created path still resolves by name, so this works for a
-    config file the caller may point anywhere with -c.
+    loudly. A not-yet-created path still resolves by name.
     """
-    jail_root = Path(jail_dir).resolve()
-    real = Path(path).resolve()
-    if _inside_jail(jail_root, real):
-        rel = str(real.relative_to(jail_root))
-        return None if rel == "." else rel
-    if _inside_jail(jail_root, Path(os.path.abspath(path))):
-        die(f"config file escapes the jail (resolves outside it): {path}")
+    real = Path(config_path).resolve()
+    for r in roots:
+        root = Path(r.dir)
+        if _inside(root, real):
+            rel = str(real.relative_to(root))
+            return None if rel == "." else (r.dir, rel)
+    abspath = Path(os.path.abspath(config_path))
+    for r in roots:
+        if _inside(Path(r.dir), abspath):
+            die(f"config file escapes the jail (resolves outside it): "
+                f"{config_path}")
     return None

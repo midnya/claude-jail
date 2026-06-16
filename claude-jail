@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Launch Claude Code inside the claude-jail Docker sandbox.
 
-    claude-jail [--user NAME] [--config PATH] <directory> [docker compose args...]
+    claude-jail [--user NAME] [--config PATH] [docker compose args...]
 
-Options before <directory> are ours; <directory> is the jail; everything after
-it is forwarded to `docker compose`. Config parsing lives in the src/ modules
-(resolve_user, build_prompt, build_env, build_mounts, jail_config), imported and
-called in-process; their die() raises SystemExit, so a bad config aborts before
-any host state is touched.
+Leading --user/--config are ours; everything else is forwarded to
+`docker compose`. The jail is anchored on the config file (default
+./.claude-jail.json, or --config): it lists the `roots` to bind-mount (or
+defaults to the config file's own directory). Config parsing lives in the src/
+modules (resolve_user, build_prompt, build_env, build_mounts, jail_config),
+imported and called in-process; their die() raises SystemExit, so a bad config
+aborts before any host state is touched.
 
 The generated mount override is never written to disk: it reaches
 `docker compose -f` through an in-memory pipe exposed as /dev/fd/N (the shell's
@@ -28,7 +30,7 @@ import build_env
 import build_mounts
 import build_prompt
 import resolve_user
-from jail_config import die, read_config, relpath_in_jail
+from jail_config import classify_config, die, parse_roots, read_config
 
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
@@ -37,14 +39,18 @@ PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 def parse_args(argv: "list[str]") -> argparse.Namespace:
     """Parse the invocation.
 
-    Forwards everything after <directory> to docker compose untouched,
-    including flags like --rm or --help meant for the container.
+    Forwards everything after our flags to docker compose untouched. REMAINDER
+    stops claiming options at the first non-option token, so a compose
+    subcommand (run, build, up, ...) needs nothing special. A compose token that
+    *looks* like an option (a global flag such as --progress, or a container
+    flag like --rm) must be guarded with a -- separator, or argparse would
+    reject it as one of ours; that leading -- is then dropped before forwarding.
     """
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
         description="Launch Claude Code inside the claude-jail Docker sandbox.",
-        usage="%(prog)s [--user NAME] [--config PATH] <directory> "
-              "[docker compose args...]",
+        usage="%(prog)s [--user NAME] [--config PATH] "
+              "[--] [docker compose args...]",
     )
     parser.add_argument(
         "-u", "--user", metavar="NAME",
@@ -54,21 +60,21 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
     )
     parser.add_argument(
         "-c", "--config", metavar="PATH",
-        help="jail config file (default: <directory>/.claude-jail.json)",
-    )
-    parser.add_argument(
-        "directory",
-        help="path to jail; bind-mounted read-write at /workspace/<directory>",
+        help="jail config file (default: ./.claude-jail.json); its roots "
+             "(or its own directory) become the jail",
     )
     parser.add_argument(
         "compose_args", nargs=argparse.REMAINDER, metavar="...",
-        help="forwarded verbatim to docker compose",
+        help="forwarded verbatim to docker compose; put -- before a compose "
+             "global flag such as --progress",
     )
     args = parser.parse_args(argv)
     if args.user == "":
         parser.error("--user requires a non-empty value")
     if args.config == "":
         parser.error("--config requires a non-empty value")
+    if args.compose_args and args.compose_args[0] == "--":
+        args.compose_args = args.compose_args[1:]
     return args
 
 
@@ -150,9 +156,10 @@ def require_docker_compose() -> None:
             "(the legacy standalone docker-compose binary is not supported)")
 
 
-# docker compose global flags that consume the following token as their value;
+# `docker compose` global flags that consume the following token as their value;
 # every other token starting with "-" is a valueless global flag. Used to find
 # the subcommand even when global flags precede it (e.g. `--progress plain run`).
+# It's a terrible solution to a silly problem, but heh.
 _COMPOSE_VALUE_FLAGS = frozenset({
     "-f", "--file", "-p", "--project-name", "--profile", "--env-file",
     "--ansi", "--progress", "--project-directory", "--parallel",
@@ -172,44 +179,47 @@ def compose_subcommand(compose_args: "list[str]") -> "str | None":
     return None
 
 
-def jail_identity(directory: str) -> "tuple[str, str, str]":
-    """Resolve the jail dir and derive its id and compose project name.
+def jail_identity(config_path: str) -> "tuple[str, str]":
+    """Derive the jail id and compose project name from the config file path.
 
-    realpath always yields an absolute path; stripping the slashes and
-    slugifying gives the id, falling back to "root" so even jailing "/" produces
-    a valid, non-empty compose project name and volume suffix.
+    The config file is the jail's anchor, so its realpath gives a stable
+    identity (the same config always maps to the same tmp volume and compose
+    project, across CWD changes). realpath always yields an absolute path;
+    stripping the slashes and slugifying gives the id, falling back to "root" so
+    even a config at "/" produces a valid, non-empty name.
     """
-    jail_dir = os.path.realpath(directory)
-    jail_id = re.sub(r"[^A-Za-z0-9]+", "-", jail_dir.strip("/")) or "root"
-    return jail_dir, jail_id, jail_id.lower()
+    real = os.path.realpath(config_path)
+    jail_id = re.sub(r"[^A-Za-z0-9]+", "-", real.strip("/")) or "root"
+    return jail_id, jail_id.lower()
 
 
-def build_jail(user_flag: "str | None", identity: "tuple[str, str, str]",
-               config_path: str) -> "tuple[str, dict, str]":
+def build_jail(user_flag: "str | None",
+               config_path: str) -> "tuple[str, dict, str, str, bool]":
     """Validate the config and assemble the launch environment and mount override.
 
-    `identity` is jail_identity()'s (jail_dir, jail_id, project) bundle, the
-    single source of the slug relationship. Runs entirely before any host state
-    is touched, so a bad config aborts via die() here. Returns (jail_user,
-    environment, override).
+    Resolves the jail roots from the config (or its own directory), confines the
+    system prompt, and masks the active config in whichever root holds it. Runs
+    entirely before any host state is touched, so a bad config aborts via die()
+    here. Returns (jail_user, environment, override, project, needs_mask), where
+    needs_mask asks the caller to ensure the empty mask file exists before
+    compose runs.
     """
-    jail_dir, jail_id, project = identity
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
-    config_rel = relpath_in_jail(jail_dir, config_path)
+    roots = parse_roots(data, config_path)
+    config_class = classify_config(roots, config_path)
     prompt = build_prompt.merge(PROMPT_FILE.read_text(encoding="utf-8"), data,
-                                jail_dir,
-                                config_path, config_rel)
+                                config_path, roots, config_class is not None)
+    jail_id, project = jail_identity(config_path)
     environment = {
-        "JAIL_DIR": jail_dir,
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
         "COMPOSE_PROJECT_NAME": project,
         "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
         **build_env.exports(data, config_path),
     }
-    override = build_mounts.override(data, jail_dir, config_path, config_rel)
-    return jail_user, environment, override
+    override, needs_mask = build_mounts.override(roots, config_class)
+    return jail_user, environment, override, project, needs_mask
 
 
 def ensure_user_config(home: Path, jail_user: str) -> None:
@@ -227,15 +237,12 @@ def ensure_user_config(home: Path, jail_user: str) -> None:
 def main() -> None:
     args = parse_args(sys.argv[1:])
     require_docker_compose()
-    if not os.path.isdir(args.directory):
-        die(f"'{args.directory}' is not a directory")
     if not PROMPT_FILE.is_file():
         die(f"base system prompt not found: {PROMPT_FILE}")
 
-    identity = jail_identity(args.directory)
-    jail_dir, _, project = identity
-    config_path = args.config or f"{jail_dir}/.claude-jail.json"
-    jail_user, environment, override = build_jail(args.user, identity, config_path)
+    config_path = args.config or os.path.join(os.getcwd(), ".claude-jail.json")
+    jail_user, environment, override, project, needs_mask = build_jail(
+        args.user, config_path)
 
     # Config is valid; now apply the env and create host state.
     os.environ.update(environment)
@@ -243,7 +250,7 @@ def main() -> None:
     if not home_env:
         die("HOME is not set; cannot locate the per-user config directory")
     ensure_user_config(Path(home_env), jail_user)
-    if build_mounts.needs_empty_mask(override):
+    if needs_mask:
         build_mounts.ensure_empty_mask()
 
     base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]

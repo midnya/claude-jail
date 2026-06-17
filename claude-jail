@@ -174,7 +174,7 @@ def compose_subcommand(compose_args: "list[str]") -> "str | None":
         tok = compose_args[i]
         if not tok.startswith("-"):
             return tok
-        if tok in _COMPOSE_VALUE_FLAGS:  # `--flag=value` self-contains its value
+        if tok in _COMPOSE_VALUE_FLAGS:  # spaced `--flag value`: skip its value too
             i += 1
         i += 1
     return None

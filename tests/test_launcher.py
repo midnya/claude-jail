@@ -57,6 +57,10 @@ class ComposeSubcommandTests(JailTestCase):
     def test_skips_valueless_global_flag(self):
         self.assertEqual(L.compose_subcommand(["--dry-run", "ps"]), "ps")
 
+    def test_skips_joined_value_global_flag(self):
+        self.assertEqual(L.compose_subcommand(["--progress=plain", "run"]),
+                         "run")
+
     def test_empty(self):
         self.assertIsNone(L.compose_subcommand([]))
 

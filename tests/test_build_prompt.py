@@ -1,4 +1,4 @@
-"""Tests for build_prompt.py: system_prompt resolution and prompt assembly."""
+"""Tests for build_prompt.py: system_prompts resolution and prompt assembly."""
 import os
 
 from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
@@ -32,7 +32,7 @@ class ResolveSegmentTests(JailTestCase):
             self.seg({"path": "p.md", "x": 1}, self.tmpdir())
 
     def test_dict_path_not_string(self):
-        with self.assertDies("'system_prompt.path'", "non-empty string"):
+        with self.assertDies("'system_prompts.path'", "non-empty string"):
             self.seg({"path": 5}, self.tmpdir())
 
     def test_file_not_found(self):
@@ -81,23 +81,23 @@ class UserPromptTests(JailTestCase):
         self.assertIsNone(self.up({}, self.tmpdir()))
 
     def test_string(self):
-        self.assertEqual(self.up({"system_prompt": "hi"}, self.tmpdir()), "hi")
+        self.assertEqual(self.up({"system_prompts": "hi"}, self.tmpdir()), "hi")
 
     def test_dict(self):
         root = self.tmpdir()
         self.write(os.path.join(root, "p.md"), "file")
-        self.assertEqual(self.up({"system_prompt": {"path": "p.md"}}, root),
+        self.assertEqual(self.up({"system_prompts": {"path": "p.md"}}, root),
                          "file")
 
     def test_list_joined_with_blank_line(self):
         root = self.tmpdir()
         self.write(os.path.join(root, "p.md"), "second")
-        out = self.up({"system_prompt": ["first", {"path": "p.md"}]}, root)
+        out = self.up({"system_prompts": ["first", {"path": "p.md"}]}, root)
         self.assertEqual(out, "first\n\nsecond")
 
     def test_invalid_type(self):
         with self.assertDies("must be a string, a"):
-            self.up({"system_prompt": 5}, self.tmpdir())
+            self.up({"system_prompts": 5}, self.tmpdir())
 
 
 class RootsSegmentTests(JailTestCase):
@@ -120,7 +120,7 @@ class MergeTests(JailTestCase):
 
     def test_order_base_then_roots_then_extra(self):
         root = self.tmpdir()
-        out = bp.merge("BASE", {"system_prompt": "EXTRA"}, "cfg.json",
+        out = bp.merge("BASE", {"system_prompts": "EXTRA"}, "cfg.json",
                        self.roots(root), True, "/workspace" + root)
         self.assertLess(out.index("BASE"), out.index("# Project roots"))
         self.assertLess(out.index("# Project roots"), out.index("EXTRA"))

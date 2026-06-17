@@ -3,7 +3,7 @@
 claude-jail reads .claude-jail.json once and hands the parsed data to several
 small modules that each interpret their own slice of it — build_mounts.py
 (roots / read_only / hidden), build_env.py (default_mode), build_prompt.py
-(system_prompt) and resolve_user.py (user). This module is their single source
+(system_prompts) and resolve_user.py (user). This module is their single source
 of truth for the things they must agree on: how errors are reported, how the
 config is read and shape-checked, what counts as a shell-/compose-safe bare
 word, what the jail's roots are, and how a path is resolved without letting it
@@ -35,7 +35,7 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # per-root only (under a `roots` entry); rejecting them — and any other unknown
 # key — at the top level turns a silently-ignored legacy config or a typo into a
 # hard error, instead of a jail that quietly drops the protections they meant.
-TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompt", "roots"}
+TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompts", "roots"}
 
 
 def die(msg: str) -> "None":
@@ -87,7 +87,7 @@ def resolved_config(config_path: str) -> Path:
 def config_dir(config_path: str) -> str:
     """The directory containing the config file, canonicalized.
 
-    The anchor every relative path in the config (roots, system_prompt.path) is
+    The anchor every relative path in the config (roots, system_prompts.path) is
     resolved against, and the agent's working directory under /workspace.
     """
     return str(resolved_config(config_path).parent)

@@ -78,7 +78,7 @@ Example:
 {
   "user": "me",
   "default_mode": "plan",
-  "system_prompt": { "path": "CLAUDE_JAIL_PROMPT.md" },
+  "system_prompts": { "path": "CLAUDE_JAIL_PROMPT.md" },
   "roots": [
     {
       "path": ".",
@@ -106,12 +106,12 @@ Available keys:
     a read-only empty file.
 - `default_mode`: the permission mode Claude starts in, forwarded to
   `claude --permission-mode`.
-- `system_prompt`: an extra system prompt, appended to the jail's built-in one.
+- `system_prompts`: an extra system prompt, appended to the jail's built-in one.
   A segment is either inline text or a file path, and you may pass one or a list of them:
-  - inline: `"system_prompt": "Prefer pnpm over npm in this repo."`
-  - file: `"system_prompt": { "path": "CLAUDE_PROMPT.md" }`
+  - inline: `"system_prompts": "Prefer pnpm over npm in this repo."`
+  - file: `"system_prompts": { "path": "CLAUDE_PROMPT.md" }`
   - list (segments joined with a blank line, in order):
-    `"system_prompt": ["Prefer pnpm over npm.", { "path": "CLAUDE_PROMPT.md" }]`
+    `"system_prompts": ["Prefer pnpm over npm.", { "path": "CLAUDE_PROMPT.md" }]`
 
 Notes:
 - `user` must be a bare word (a letter, then letters/digits/`-`/`_`).
@@ -123,7 +123,7 @@ Notes:
   including the active config wherever it sits, even if it doesn't exist yet.
 - A config path that names something inside a root but escapes via a symlink is
   a hard error.
-- A `system_prompt.path` file is read on the host at launch (its text is
+- A `system_prompts.path` file is read on the host at launch (its text is
   injected into the prompt, never mounted), relative to the config file's
   directory. The read never follows a symlink. For a config inside the
   jail the file must resolve inside some root; for a config outside
@@ -131,5 +131,5 @@ Notes:
 - Per-root `read_only`/`hidden` paths must be relative and stay inside their
   root. When a path is listed under both, `hidden` wins.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
-- A missing or empty `system_prompt.path` file is a hard error.
+- A missing or empty `system_prompts.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.

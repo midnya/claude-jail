@@ -1,15 +1,15 @@
 """Merge the jail system prompt with an optional project-supplied one.
 
 build_mounts.py owns the filesystem keys and build_env.py the bare-word
-settings; this module owns the one free-text setting, system_prompt. The shared
+settings; this module owns the one free-text setting, system_prompts. The shared
 parsing/validation helpers live in jail_config.py.
 
-merge() joins the base jail prompt with `system_prompt` from .claude-jail.json.
+merge() joins the base jail prompt with `system_prompts` from .claude-jail.json.
 A prompt is one or more segments, each either inline text or a file:
 
-    "system_prompt": "inline text..."          # used verbatim
-    "system_prompt": {"path": "path/to.md"}    # read from a file
-    "system_prompt": ["intro...", {"path": "more.md"}]   # segments joined
+    "system_prompts": "inline text..."          # used verbatim
+    "system_prompts": {"path": "path/to.md"}    # read from a file
+    "system_prompts": ["intro...", {"path": "more.md"}]   # segments joined
 
 A list's segments are joined with a blank line, in order; a bare string or
 object is shorthand for a single-segment list.
@@ -31,12 +31,12 @@ from pathlib import Path
 from jail_config import (Root, config_dir, confine_to_roots, container_path,
                          die, trusted_host_path)
 
-SETTING = "system_prompt"
+SETTING = "system_prompts"
 
 
 def prompt_path(cfg_dir: str, roots: "list[Root]", config_in_jail: bool,
                 rel: str) -> Path:
-    """Locate a system_prompt file to read on the host.
+    """Locate a system_prompts file to read on the host.
 
     Resolved relative to `cfg_dir`, the directory containing the config file. An
     in-jail config is agent-writable, so confine_to_roots refuses to follow any
@@ -93,7 +93,7 @@ def user_prompt(data: "dict", config_file: str, cfg_dir: str,
                 roots: "list[Root]", config_in_jail: bool) -> "str | None":
     """Resolve the project-supplied prompt text, or None when unset.
 
-    `system_prompt` may be a single segment (an inline string or a
+    `system_prompts` may be a single segment (an inline string or a
     {"path": ...} object) or a list of such segments joined with a blank line.
     `config_in_jail` (True when classify_config placed the config inside the
     roots) is threaded down to prompt_path, which confines an in-jail config's
@@ -143,7 +143,7 @@ def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
     """Merge the base jail prompt, the runtime roots, and the project prompt.
 
     In order: the base jail prompt, the generated project-roots section, then
-    the project's own system_prompt, separated by blank lines. With no project
+    the project's own system_prompts, separated by blank lines. With no project
     prompt the first two still pass through. `workdir` is the container working
     directory the agent starts in.
     """

@@ -35,7 +35,7 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # per-root only (under a `roots` entry); rejecting them — and any other unknown
 # key — at the top level turns a silently-ignored legacy config or a typo into a
 # hard error, instead of a jail that quietly drops the protections they meant.
-TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompts", "roots"}
+TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompts", "roots", "egress"}
 
 
 def die(msg: str) -> "None":

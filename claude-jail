@@ -26,6 +26,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR / "src"))
 
+import build_acl
 import build_env
 import build_mounts
 import build_prompt
@@ -243,6 +244,7 @@ def build_jail(user_flag: "str | None",
         "JAIL_WORKDIR": workdir,
         "COMPOSE_PROJECT_NAME": project,
         "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
+        "JAIL_SQUID_ACL": build_acl.squid_rules(data, config_path),
         **build_env.exports(data, config_path),
     }
     override, seeds = build_mounts.override(roots, config_class)

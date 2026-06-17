@@ -7,7 +7,7 @@ RUN apt-get update && \
 
 COPY squid.conf /etc/squid/squid.conf
 COPY entrypoint.sh /usr/local/bin/entrypoint
-RUN chmod +x /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint && touch /etc/squid/jail-acl.conf
 
 EXPOSE 3128
 

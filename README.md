@@ -19,9 +19,10 @@ Its .git has always been quarantined. Use at your own risk.
 - Network isolation: the jail container sits on an `internal` Docker network.
   All egress is forced through a [Squid](https://www.squid-cache.org/)
   proxy.
- - (For now) the proxy applies no destination ACLs; it allows all requests
-    and logs them. The logs persist in a per-jail volume. Future work will
-    allow ACLs.
+  - The proxy filters egress by destination host. The policy is
+    **default-deny**: with no `egress` config, only `*.anthropic.com` and
+    `*.claude.com` are reachable. A project widens or narrows it via the `egress` key (see
+    [Configuration](#configuration)). Every request is logged to a per-jail volume.
 
 ## Invocation
 
@@ -82,6 +83,7 @@ Example:
   "user": "me",
   "default_mode": "plan",
   "system_prompts": { "path": "CLAUDE_JAIL_PROMPT.md" },
+  "egress": { "default": "deny", "allowed": ["*.github.com", "pypi.org"] },
   "roots": [
     {
       "path": ".",
@@ -109,6 +111,15 @@ Available keys:
     a read-only empty file.
 - `default_mode`: the permission mode Claude starts in, forwarded to
   `claude --permission-mode`.
+- `egress`: the network egress policy enforced by the Squid proxy. An object:
+  - `default`: `"deny"` (the default) or `"allow"`.
+  - With `default: "deny"`, `allowed` lists the hosts that may be reached;
+    everything else is blocked. With `default: "allow"`, `denied` lists the hosts
+    to block; everything else is reached. (The list that doesn't match `default`
+    is rejected.)
+  - A host pattern is an exact host (`example.com`) or a subdomain wildcard
+    (`*.example.com`, matching the apex and every subdomain).
+  - `*.anthropic.com` and `*.claude.com` are always reachable, so the jail can always reach the API.
 - `system_prompts`: an extra system prompt, appended to the jail's built-in one.
   A segment is either inline text or a file path, and you may pass one or a list of them:
   - inline: `"system_prompts": "Prefer pnpm over npm in this repo."`
@@ -118,6 +129,9 @@ Available keys:
 
 Notes:
 - `user` must be a bare word (a letter, then letters/digits/`-`/`_`).
+- Egress is default-deny: without an `egress` key the jail can reach only
+  `*.anthropic.com` and `*.claude.com`. A `*.example.com` pattern matches the
+  apex and every subdomain.
 - `.git` in every root is always read-only.
 - Each root must be an existing directory; roots may not be nested in or
   duplicate one another, nor be the filesystem root `/`, your home directory,

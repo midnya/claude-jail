@@ -47,6 +47,8 @@ services:
     networks:
       - jail-internal
       - jail-egress
+    environment:
+      JAIL_SQUID_ACL: ${JAIL_SQUID_ACL:-}
     volumes:
       - type: volume
         source: jail-squid-logs

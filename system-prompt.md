@@ -32,7 +32,10 @@ don't try to work around them:
   `HTTP_PROXY`/`HTTPS_PROXY` environment variables, and every request is logged.
   Use ordinary tools (git, gh, curl, npm, …) normally — they honour the proxy.
   Don't try to bypass it or unset those variables; anything that ignores the
-  proxy simply has no way out and will fail to connect.
+  proxy simply has no way out and will fail to connect. The proxy also enforces a
+  destination allow/deny policy (default-deny: only approved hosts are reachable),
+  so a request can come back refused (HTTP 403) by policy — that's expected, not a
+  bug. Report the blocked host rather than trying to route around the proxy.
 - **Containerized filesystem.** Everything runs inside the container. Only the
   project roots mounted under `/workspace` (listed under "Project roots" below,
   where your working directory sits) are real. Changes elsewhere in the

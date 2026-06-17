@@ -1,12 +1,15 @@
 # claude-jail
 
-Run Claude Code inside a locked-down Docker container.  
-Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).  
+Run Claude Code inside a locked-down Docker container.
+
+Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).
+
 Still in active development; bug reports, feature requests, and PRs are most welcome!
 
 ## AI usage disclosure
 
-`claude-jail` has partly been built with `Claude` itself. Its .git has always been quarantined.
+`claude-jail` has partly been built with `Claude` itself; my time is, bluntly, better spent elsewhere.
+Its .git has always been quarantined. Use at your own risk.
 
 ## Security model (so far)
 
@@ -49,14 +52,14 @@ claude-jail --user me build --no-cache
 Start an interactive session:
 
 ```sh
-claude-jail --user me run --rm claude-jail
+claude-jail --user me run --rm claude
 ```
 
 Any extra args after the service name are passed straight through to `claude`:
 
 ```sh
-claude-jail --user me run --rm claude-jail --help
-claude-jail --user me run --rm claude-jail -p "summarize this repo"
+claude-jail --user me run --rm claude --help
+claude-jail --user me run --rm claude -p "summarize this repo"
 ```
 
 With a `user` key set in the config, the `--user` flag can be omitted.
@@ -64,7 +67,7 @@ With a `user` key set in the config, the `--user` flag can be omitted.
 `-c` lets you launch from anywhere:
 
 ```sh
-claude-jail -c ~/code/myproject/.claude-jail.json run --rm claude-jail
+claude-jail -c ~/code/myproject/.claude-jail.json run --rm claude
 ```
 
 ## Configuration

@@ -73,10 +73,19 @@ class JailIdentityTests(JailTestCase):
         sub = self.mkdir(os.path.join(self.tmpdir(), "proj.v1_2 x"))
         cfg = self.write(os.path.join(sub, ".claude-jail.json"), "{}")
         jail_id, project = L.jail_identity(cfg)
+        # JAIL_ID slugs the whole config-file realpath (volumes stay unique).
         self.assertTrue(jail_id.endswith("proj-v1-2-x-claude-jail-json"),
                         f"unexpected slug tail: {jail_id}")
         self.assertRegex(jail_id, r"\A[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\Z")
-        self.assertEqual(project, jail_id.lower())
+        # The compose project name slugs only the config's directory name.
+        self.assertEqual(project, "proj-v1-2-x")
+
+    def test_project_is_lowercased_dir_basename(self):
+        sub = self.mkdir(os.path.join(self.tmpdir(), "MyProject"))
+        cfg = self.write(os.path.join(sub, ".claude-jail.json"), "{}")
+        jail_id, project = L.jail_identity(cfg)
+        self.assertEqual(project, "myproject")
+        self.assertNotEqual(project, jail_id)  # decoupled from the volume id
 
     def test_root_fallback(self):
         # A config that resolves to "/" slugs to nothing, falling back to "root".

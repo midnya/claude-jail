@@ -128,7 +128,7 @@ def cleanup_side_containers(base_cmd: "list[str]", project: str) -> None:
         result = subprocess.run(
             ["docker", "ps", "-q",
              "--filter", f"label=com.docker.compose.project={project}",
-             "--filter", "label=com.docker.compose.service=claude-jail"],
+             "--filter", "label=com.docker.compose.service=claude"],
             capture_output=True, text=True,
         )
         # Tear down only when the count succeeded and found no live sessions;
@@ -186,14 +186,18 @@ def jail_identity(config_path: str) -> "tuple[str, str]":
     """Derive the jail id and compose project name from the config file path.
 
     The config file is the jail's anchor, so its realpath gives a stable
-    identity (the same config always maps to the same tmp volume and compose
-    project, across CWD changes). realpath always yields an absolute path;
-    stripping the slashes and slugifying gives the id, falling back to "root" so
-    even a config at "/" produces a valid, non-empty name.
+    identity across CWD changes. JAIL_ID slugs the *full* realpath, keeping the
+    tmp / squid-logs volume names unique and predictable. The compose project
+    name — which docker turns into the container and network names — slugs only
+    the config's directory name, so a container reads as `myproject-claude-run-…`
+    instead of repeating the whole path. Both fall back to "root" so even a
+    config at "/" produces a valid, non-empty name; distinct directories that
+    share a basename collide onto one project (accepted, like the JAIL_ID slug).
     """
-    real = str(resolved_config(config_path))
-    jail_id = re.sub(r"[^A-Za-z0-9]+", "-", real.strip("/")) or "root"
-    return jail_id, jail_id.lower()
+    real = resolved_config(config_path)
+    jail_id = re.sub(r"[^A-Za-z0-9]+", "-", str(real).strip("/")) or "root"
+    project = re.sub(r"[^A-Za-z0-9]+", "-", real.parent.name) or "root"
+    return jail_id, project.lower()
 
 
 def container_workdir(config_path: str) -> str:

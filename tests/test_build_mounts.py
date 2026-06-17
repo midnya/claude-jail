@@ -232,7 +232,7 @@ class OverrideTests(JailTestCase):
             [Root(root, ["cfg.yml"], ["secret"])], None)
 
         self.assertTrue(document.startswith(
-            "services:\n  claude-jail:\n    volumes:\n"))
+            "services:\n  claude:\n    volumes:\n"))
         # The root itself is bound read-write.
         self.assertIn(f'source: "{root}"', document)
         self.assertIn(f'target: "/workspace{root}"', document)

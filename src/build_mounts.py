@@ -285,6 +285,6 @@ def override(roots: "list[Root]", config_class: "tuple[str, str] | None"
         seeds += root_seeds
     if not volumes:
         return "", []
-    out: "list[str]" = ["services:", "  claude-jail:", "    volumes:"]
+    out: "list[str]" = ["services:", "  claude:", "    volumes:"]
     out += volumes
     return "\n".join(out) + "\n", seeds

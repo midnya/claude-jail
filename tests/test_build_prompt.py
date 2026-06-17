@@ -1,0 +1,129 @@
+"""Tests for build_prompt.py: system_prompt resolution and prompt assembly."""
+import os
+
+from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
+
+import build_prompt as bp
+
+
+class ResolveSegmentTests(JailTestCase):
+    def seg(self, value, root, in_jail=True):
+        return bp.resolve_segment(value, "cfg.json", root, self.roots(root),
+                                  in_jail)
+
+    def test_inline_string_verbatim(self):
+        self.assertEqual(self.seg("hello", self.tmpdir()), "hello")
+
+    def test_inline_empty_rejected(self):
+        with self.assertDies("must not be empty"):
+            self.seg("   ", self.tmpdir())
+
+    def test_inline_nul_rejected(self):
+        with self.assertDies("must not contain a NUL byte"):
+            self.seg("a\x00b", self.tmpdir())
+
+    def test_dict_path_read(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "from file")
+        self.assertEqual(self.seg({"path": "p.md"}, root), "from file")
+
+    def test_dict_extra_key_rejected(self):
+        with self.assertDies("exactly a 'path' key"):
+            self.seg({"path": "p.md", "x": 1}, self.tmpdir())
+
+    def test_dict_path_not_string(self):
+        with self.assertDies("'system_prompt.path'", "non-empty string"):
+            self.seg({"path": 5}, self.tmpdir())
+
+    def test_file_not_found(self):
+        with self.assertDies("file not found"):
+            self.seg({"path": "missing.md"}, self.tmpdir())
+
+    def test_empty_file_rejected(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "   \n")
+        with self.assertDies("is empty"):
+            self.seg({"path": "p.md"}, root)
+
+    def test_file_with_nul_rejected(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "ok\x00no")
+        with self.assertDies("must not contain a NUL byte"):
+            self.seg({"path": "p.md"}, root)
+
+    def test_bad_segment_type(self):
+        with self.assertDies("must be a string or a"):
+            self.seg(123, self.tmpdir())
+
+
+class PromptPathConfinementTests(JailTestCase):
+    def test_in_jail_path_escaping_roots_rejected(self):
+        root = self.tmpdir()
+        with self.assertDies("escapes the jail"):
+            bp.resolve_segment({"path": "../out/p.md"}, "cfg", root,
+                               self.roots(root), True)
+
+    def test_external_config_may_read_outside_roots(self):
+        # An external (--config) prompt file is trusted and may live anywhere.
+        root = self.tmpdir()
+        outside = self.tmpdir()
+        self.write(os.path.join(outside, "p.md"), "trusted")
+        text = bp.resolve_segment({"path": os.path.join(outside, "p.md")},
+                                  "cfg", root, self.roots(root), False)
+        self.assertEqual(text, "trusted")
+
+
+class UserPromptTests(JailTestCase):
+    def up(self, data, root, in_jail=True):
+        return bp.user_prompt(data, "cfg.json", root, self.roots(root), in_jail)
+
+    def test_absent_is_none(self):
+        self.assertIsNone(self.up({}, self.tmpdir()))
+
+    def test_string(self):
+        self.assertEqual(self.up({"system_prompt": "hi"}, self.tmpdir()), "hi")
+
+    def test_dict(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "file")
+        self.assertEqual(self.up({"system_prompt": {"path": "p.md"}}, root),
+                         "file")
+
+    def test_list_joined_with_blank_line(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "second")
+        out = self.up({"system_prompt": ["first", {"path": "p.md"}]}, root)
+        self.assertEqual(out, "first\n\nsecond")
+
+    def test_invalid_type(self):
+        with self.assertDies("must be a string, a"):
+            self.up({"system_prompt": 5}, self.tmpdir())
+
+
+class RootsSegmentTests(JailTestCase):
+    def test_lists_workdir_and_roots(self):
+        a, b = self.tmpdir(), self.tmpdir()
+        out = bp.roots_segment(self.roots(a, b), "/workspace" + a)
+        self.assertIn("# Project roots", out)
+        self.assertIn("/workspace" + a, out)
+        self.assertIn(f"- `/workspace{a}`", out)
+        self.assertIn(f"- `/workspace{b}`", out)
+
+
+class MergeTests(JailTestCase):
+    def test_base_and_roots_without_project_prompt(self):
+        root = self.tmpdir()
+        out = bp.merge("BASE", {}, "cfg.json", self.roots(root), True,
+                       "/workspace" + root)
+        # The base and the roots section are separated by a blank line.
+        self.assertIn("BASE\n\n# Project roots", out)
+
+    def test_order_base_then_roots_then_extra(self):
+        root = self.tmpdir()
+        out = bp.merge("BASE", {"system_prompt": "EXTRA"}, "cfg.json",
+                       self.roots(root), True, "/workspace" + root)
+        self.assertLess(out.index("BASE"), out.index("# Project roots"))
+        self.assertLess(out.index("# Project roots"), out.index("EXTRA"))
+        # Each boundary is a real blank-line separator, not just concatenation.
+        self.assertIn("BASE\n\n# Project roots", out)
+        self.assertIn("\n\nEXTRA", out)

@@ -30,7 +30,8 @@ import build_env
 import build_mounts
 import build_prompt
 import resolve_user
-from jail_config import classify_config, die, parse_roots, read_config
+from jail_config import (classify_config, config_dir, container_path, die,
+                         parse_roots, read_config, resolved_config)
 
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
@@ -178,6 +179,8 @@ def compose_subcommand(compose_args: "list[str]") -> "str | None":
         i += 1
     return None
 
+_LAUNCH_SUBCOMMANDS = frozenset({"run", "up", "create", "start", "restart"})
+
 
 def jail_identity(config_path: str) -> "tuple[str, str]":
     """Derive the jail id and compose project name from the config file path.
@@ -188,48 +191,68 @@ def jail_identity(config_path: str) -> "tuple[str, str]":
     stripping the slashes and slugifying gives the id, falling back to "root" so
     even a config at "/" produces a valid, non-empty name.
     """
-    real = os.path.realpath(config_path)
+    real = str(resolved_config(config_path))
     jail_id = re.sub(r"[^A-Za-z0-9]+", "-", real.strip("/")) or "root"
     return jail_id, jail_id.lower()
 
 
+def container_workdir(config_path: str) -> str:
+    """The container working directory: the config file's own directory, mounted.
+
+    Each jail root at host path D is bound into the container at /workspace{D},
+    so the config file's directory lands at /workspace<dir>, opening the agent
+    inside the project rather than at the bare /workspace above the mounts.
+
+    This path is used even when the config's directory is not one of the mounted
+    roots (docker creates the missing working dir as an empty directory). Falling
+    back to a shared /workspace there would hand every such jail the same working
+    directory, so anything keyed on it — claude's per-project history/state under
+    the shared per-user config — would bleed between unrelated workspaces. The
+    config-derived path keeps each workspace distinct.
+    """
+    return container_path(config_dir(config_path))
+
+
 def build_jail(user_flag: "str | None",
-               config_path: str) -> "tuple[str, dict, str, str, bool]":
+               config_path: str) -> "tuple[dict, str, list[str]]":
     """Validate the config and assemble the launch environment and mount override.
 
     Resolves the jail roots from the config (or its own directory), confines the
     system prompt, and masks the active config in whichever root holds it. Runs
     entirely before any host state is touched, so a bad config aborts via die()
-    here. Returns (jail_user, environment, override, project, needs_mask), where
-    needs_mask asks the caller to ensure the empty mask file exists before
-    compose runs.
+    here. Returns (environment, override, seeds): the jail user and compose
+    project name live in environment (JAIL_USER / COMPOSE_PROJECT_NAME); seeds
+    lists absent config files the caller creates as `{}` before a container launch.
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
     roots = parse_roots(data, config_path)
     config_class = classify_config(roots, config_path)
+    workdir = container_workdir(config_path)
     prompt = build_prompt.merge(PROMPT_FILE.read_text(encoding="utf-8"), data,
-                                config_path, roots, config_class is not None)
+                                config_path, roots, config_class is not None,
+                                workdir)
     jail_id, project = jail_identity(config_path)
     environment = {
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
+        "JAIL_WORKDIR": workdir,
         "COMPOSE_PROJECT_NAME": project,
         "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
         **build_env.exports(data, config_path),
     }
-    override, needs_mask = build_mounts.override(roots, config_class)
-    return jail_user, environment, override, project, needs_mask
+    override, seeds = build_mounts.override(roots, config_class)
+    return environment, override, seeds
 
 
 def ensure_user_config(home: Path, jail_user: str) -> None:
     """Create the per-user config dir/file on the host if they don't exist."""
-    config_dir = home / f".claude-jail-{jail_user}"
-    config_file = home / f".claude-jail-{jail_user}.json"
+    user_dir = home / f".claude-jail-{jail_user}"
+    user_file = home / f".claude-jail-{jail_user}.json"
     try:
-        config_dir.mkdir(parents=True, exist_ok=True)
-        if not config_file.exists():
-            config_file.write_text("{}\n")
+        user_dir.mkdir(parents=True, exist_ok=True)
+        if not user_file.exists():
+            user_file.write_text("{}\n")
     except OSError as e:
         die(f"could not create the per-user config in {home}: {e}")
 
@@ -241,22 +264,27 @@ def main() -> None:
         die(f"base system prompt not found: {PROMPT_FILE}")
 
     config_path = args.config or os.path.join(os.getcwd(), ".claude-jail.json")
-    jail_user, environment, override, project, needs_mask = build_jail(
-        args.user, config_path)
+    environment, override, seeds = build_jail(args.user, config_path)
 
-    # Config is valid; now apply the env and create host state.
+    # Config is valid; now apply the env.
     os.environ.update(environment)
-    home_env = os.environ.get("HOME")
-    if not home_env:
-        die("HOME is not set; cannot locate the per-user config directory")
-    ensure_user_config(Path(home_env), jail_user)
-    if needs_mask:
-        build_mounts.ensure_empty_mask()
 
     base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
+    subcommand = compose_subcommand(args.compose_args)
+    # Only a subcommand that actually launches the jail container needs the host
+    # state the mounts consume (see _LAUNCH_SUBCOMMANDS).
+    if subcommand in _LAUNCH_SUBCOMMANDS:
+        home_env = os.environ.get("HOME")
+        if not home_env:
+            die("HOME is not set; cannot locate the per-user config directory")
+        ensure_user_config(Path(home_env), environment["JAIL_USER"])
+        if override:
+            build_mounts.ensure_empty_mask()
+        build_mounts.seed_masked_configs(seeds)
+
     status = run_compose(base_cmd, args.compose_args, override)
-    if compose_subcommand(args.compose_args) == "run":
-        cleanup_side_containers(base_cmd, project)
+    if subcommand == "run":
+        cleanup_side_containers(base_cmd, environment["COMPOSE_PROJECT_NAME"])
     sys.exit(status)
 
 

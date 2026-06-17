@@ -31,6 +31,12 @@ BARE_WORD = re.compile(r"\A[A-Za-z][A-Za-z0-9_-]*\Z")
 # Keys recognised inside a `roots` entry object.
 ROOT_KEYS = {"path", "read_only", "hidden"}
 
+# Keys recognised at the top level of .claude-jail.json. read_only/hidden are
+# per-root only (under a `roots` entry); rejecting them — and any other unknown
+# key — at the top level turns a silently-ignored legacy config or a typo into a
+# hard error, instead of a jail that quietly drops the protections they meant.
+TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompt", "roots"}
+
 
 def die(msg: str) -> "None":
     """Print 'Error: <msg>' to stderr and exit non-zero."""
@@ -39,10 +45,17 @@ def die(msg: str) -> "None":
 
 def read_config(config_file: str) -> "dict":
     """Read and JSON-parse the jail config, returning {} when absent."""
-    if not Path(config_file).is_file():
+    path = Path(config_file)
+    if not path.is_file():
+        # A path that exists but is not a regular file (a directory, FIFO, ...)
+        # is a mistake, not an absent config: treating it as {} would silently
+        # jail the *parent* directory, so fail loudly. A truly absent path is
+        # fine — it yields the default config.
+        if path.exists():
+            die(f"config path is not a regular file: {config_file}")
         return {}
     try:
-        text = Path(config_file).read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         die(f"could not read {config_file}: {e}")
     try:
@@ -51,7 +64,42 @@ def read_config(config_file: str) -> "dict":
         die(f"invalid JSON in {config_file}: {e}")
     if not isinstance(data, dict):
         die(f"{config_file} must contain a JSON object")
+    unknown = set(data) - TOP_LEVEL_KEYS
+    if unknown:
+        legacy = unknown & {"read_only", "hidden"}
+        if legacy:
+            die(f"{config_file}: {sorted(legacy)} are now per-root keys; move "
+                f"them inside a 'roots' entry (see README)")
+        die(f"unknown top-level key(s) in {config_file}: {sorted(unknown)}")
     return data
+
+
+def resolved_config(config_path: str) -> Path:
+    """The config file's canonical (realpath) absolute path.
+
+    The single canonicalization for the config anchor, so the jail identity, the
+    working directory, the roots and the prompt files all agree on where the
+    config really is (one API — no os.path.realpath vs Path.resolve drift).
+    """
+    return Path(config_path).resolve()
+
+
+def config_dir(config_path: str) -> str:
+    """The directory containing the config file, canonicalized.
+
+    The anchor every relative path in the config (roots, system_prompt.path) is
+    resolved against, and the agent's working directory under /workspace.
+    """
+    return str(resolved_config(config_path).parent)
+
+
+def container_path(host_dir: str) -> str:
+    """The container mount target for a host path: /workspace<host path>.
+
+    The single host->container mapping shared by the bind mounts, the working
+    directory and the project-roots prompt, so they cannot drift apart.
+    """
+    return f"/workspace{host_dir}"
 
 
 class Root:
@@ -75,15 +123,22 @@ def _inside(root: Path, target: Path) -> bool:
 
 
 def _forbidden_root(root_dir: str) -> bool:
-    """True for a root too broad to jail: the filesystem root or $HOME.
+    """True for a root too broad to jail: the filesystem root, or $HOME or any
+    ancestor of it.
 
-    Either would bind-mount the whole tree (host secrets, the per-user
-    credential dirs) read-write into the sandbox, defeating the jail.
+    The filesystem root bind-mounts the whole host. $HOME — or any directory
+    that contains it (e.g. /home) — bind-mounts the per-user credential store
+    (~/.claude-jail-*) read-write into the sandbox, letting the agent steal or
+    rewrite its own login, so reject the home directory and every ancestor, not
+    just an exact match.
     """
     if root_dir == os.sep:
         return True
     home = os.environ.get("HOME")
-    return bool(home) and root_dir == os.path.realpath(home)
+    if not home:
+        return False
+    # _inside(root, home) is True when root *is* HOME or an ancestor of it.
+    return _inside(Path(root_dir), Path(os.path.realpath(home)))
 
 
 def _key_list(entry: "dict", key: str, config_file: str) -> "list":
@@ -105,7 +160,7 @@ def parse_roots(data: "dict", config_file: str) -> "list[Root]":
     an existing directory, and roots may not be nested in or duplicate one
     another (overlapping bind mounts). Calls die() on any violation.
     """
-    config_dir = str(Path(config_file).resolve().parent)
+    base = config_dir(config_file)
     entries = data.get("roots")
     if entries is None:
         entries = ["."]
@@ -130,13 +185,13 @@ def parse_roots(data: "dict", config_file: str) -> "list[Root]":
             die(f"'roots[].path' in {config_file} must be a non-empty string")
         p = Path(path)
         if not p.is_absolute():
-            p = Path(config_dir) / path
+            p = Path(base) / path
         root_dir = os.path.realpath(p)
         if not os.path.isdir(root_dir):
             die(f"root path is not a directory: {path}")
         if _forbidden_root(root_dir):
-            die(f"a jail root may not be the filesystem root or your home "
-                f"directory: {path}")
+            die(f"a jail root may not be the filesystem root, your home "
+                f"directory, or a directory containing it: {path}")
         for other in roots:
             if (root_dir == other.dir
                     or _inside(Path(root_dir), Path(other.dir))
@@ -172,22 +227,14 @@ def resolve_in_root(root_dir: str, rel: str, what: str) -> Path:
     return target
 
 
-def safe_host_path(base_dir: str, rel: str, roots: "list[Root]",
-                   trusted: bool, what: str) -> Path:
-    """Resolve a host file to read at launch, refusing any agent redirect.
+def _walk_no_symlink(base_dir: str, rel: str, what: str) -> Path:
+    """Walk `rel` from `base_dir` one component at a time, refusing any symlink.
 
-    The file's bytes are read on the host and injected into the agent's prompt,
-    so the agent — which controls every byte inside a jail root — must not be
-    able to point the read at a file it could not itself read. We walk `rel`
-    one component at a time from the trusted, already-resolved `base_dir` (the
-    config file's directory) and refuse to traverse a symlink: a planted
-    symlink (e.g. doc.md -> a hidden file, or -> a host secret outside the jail)
-    is the whole attack, so following one is never safe here.
-
-    For an in-jail config (`trusted` False) the resolved file must additionally
-    land inside some root. For an external, user-owned config (`trusted` True)
-    the file may live anywhere and an absolute `rel` is taken as-is. Calls die()
-    on a symlink in the path or, when untrusted, a target outside every root.
+    Returns the lexical path (no .resolve()): because every existing component
+    is checked not to be a symlink, that lexical path equals the real one. A
+    planted symlink (e.g. doc.md -> a hidden file, or -> a host secret) is the
+    whole attack, so traversing one is never allowed. An absolute `rel` walks
+    from the filesystem root; `..` climbs lexically.
     """
     pp = PurePosixPath(rel)
     if pp.is_absolute():
@@ -201,9 +248,32 @@ def safe_host_path(base_dir: str, rel: str, roots: "list[Root]",
         cur = cur / part
         if cur.is_symlink():
             die(f"{what} must not traverse a symlink: {rel}")
-    if not trusted and not any(_inside(Path(r.dir), cur) for r in roots):
+    return cur
+
+
+def confine_to_roots(base_dir: str, rel: str, roots: "list[Root]",
+                     what: str) -> Path:
+    """Resolve an agent-influenced host file: refuse symlinks AND confine to a root.
+
+    For a config that lives inside the jail, the agent controls every byte under
+    a root, so a file read into its prompt must be one it could already read: no
+    symlink may be traversed and the result must land inside some root. Walking
+    from the trusted, already-resolved `base_dir` (the config file's directory).
+    """
+    cur = _walk_no_symlink(base_dir, rel, what)
+    if not any(_inside(Path(r.dir), cur) for r in roots):
         die(f"{what} escapes the jail (resolves outside every root): {rel}")
     return cur
+
+
+def trusted_host_path(base_dir: str, rel: str, what: str) -> Path:
+    """Resolve a user-owned host file: refuse symlinks, but allow it anywhere.
+
+    For a `--config` the user keeps outside the jail the file is trusted and may
+    live anywhere (an absolute `rel` is taken as-is); a symlink is still refused,
+    so an in-root file the agent controls cannot redirect the read.
+    """
+    return _walk_no_symlink(base_dir, rel, what)
 
 
 def classify_config(roots: "list[Root]",
@@ -222,7 +292,7 @@ def classify_config(roots: "list[Root]",
     could otherwise dodge the mask that hides the active config, so it dies
     loudly. A not-yet-created path still resolves by name.
     """
-    real = Path(config_path).resolve()
+    real = resolved_config(config_path)
     for r in roots:
         root = Path(r.dir)
         if _inside(root, real):

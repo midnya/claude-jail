@@ -97,6 +97,8 @@ Available keys:
   object `{ "path", "read_only", "hidden" }`. A relative `path` is resolved
   against the config file's directory; an absolute one is taken as-is. Omit
   `roots` to jail the config file's own directory.
+  - The session starts in the config file's directory, mounted under `/workspace`.
+    Should the config's directory not be part of the roots, that directory will be empty.
   - `read_only` (per root): paths relative to that root, bind-mounted read-only.
     Visible inside the jail but writes fail at the filesystem level.
   - `hidden` (per root): paths relative to that root, masked to empty. A hidden
@@ -115,7 +117,8 @@ Notes:
 - `user` must be a bare word (a letter, then letters/digits/`-`/`_`).
 - `.git` in every root is always read-only.
 - Each root must be an existing directory; roots may not be nested in or
-  duplicate one another, nor be the filesystem root `/` or your home directory.
+  duplicate one another, nor be the filesystem root `/`, your home directory,
+  or a directory containing it.
 - `.claude-jail.json` in every root is hidden inside the container,
   including the active config wherever it sits, even if it doesn't exist yet.
 - A config path that names something inside a root but escapes via a symlink is

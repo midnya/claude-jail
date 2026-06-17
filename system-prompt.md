@@ -33,9 +33,9 @@ don't try to work around them:
   Use ordinary tools (git, gh, curl, npm, …) normally — they honour the proxy.
   Don't try to bypass it or unset those variables; anything that ignores the
   proxy simply has no way out and will fail to connect.
-- **Containerized filesystem.** Everything runs inside the container. Your
-  working directory is `/workspace`; only the project roots mounted beneath it
-  (listed under "Project roots" below) are real. Changes elsewhere in the
+- **Containerized filesystem.** Everything runs inside the container. Only the
+  project roots mounted under `/workspace` (listed under "Project roots" below,
+  where your working directory sits) are real. Changes elsewhere in the
   filesystem are ephemeral and lost when the container exits.
 - **`/tmp` persists across runs.** `/tmp` is kept between container invocations,
   so use it as durable scratch space — cache downloads, build artifacts,

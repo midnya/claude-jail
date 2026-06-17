@@ -28,29 +28,31 @@ segment containing a NUL byte (which cannot be placed in the environment).
 """
 from pathlib import Path
 
-from jail_config import Root, die, safe_host_path
+from jail_config import (Root, config_dir, confine_to_roots, container_path,
+                         die, trusted_host_path)
 
 SETTING = "system_prompt"
 
 
-def prompt_path(config_dir: str, roots: "list[Root]", config_in_jail: bool,
+def prompt_path(cfg_dir: str, roots: "list[Root]", config_in_jail: bool,
                 rel: str) -> Path:
     """Locate a system_prompt file to read on the host.
 
-    Resolved relative to `config_dir`, the directory containing the config
-    file. A config inside the jail is agent-writable, so safe_host_path refuses
-    to follow any symlink and confines the resolved file to a jail root —
-    otherwise the agent could redirect it at a host secret and read it back
-    through its own injected prompt. A config the user keeps outside the jail is
-    trusted: an absolute path is taken as-is and it may live anywhere (still no
-    symlink is followed, so an in-root file the agent controls cannot redirect
-    the read).
+    Resolved relative to `cfg_dir`, the directory containing the config file. An
+    in-jail config is agent-writable, so confine_to_roots refuses to follow any
+    symlink and requires the result to land inside a jail root — otherwise the
+    agent could redirect it at a host secret and read it back through its own
+    injected prompt. An external (`--config`) config is trusted: the file may
+    live anywhere (an absolute path is taken as-is), though a symlink is still
+    refused so an in-root file the agent controls cannot redirect the read.
     """
-    return safe_host_path(config_dir, rel, roots, trusted=not config_in_jail,
-                          what=f"'{SETTING}.path'")
+    what = f"'{SETTING}.path'"
+    if config_in_jail:
+        return confine_to_roots(cfg_dir, rel, roots, what)
+    return trusted_host_path(cfg_dir, rel, what)
 
 
-def resolve_segment(value: "object", config_file: str, config_dir: str,
+def resolve_segment(value: "object", config_file: str, cfg_dir: str,
                     roots: "list[Root]", config_in_jail: bool) -> str:
     """Resolve one prompt segment (inline string or {"path": ...}) to text.
 
@@ -71,7 +73,7 @@ def resolve_segment(value: "object", config_file: str, config_dir: str,
         rel = value["path"]
         if not isinstance(rel, str) or not rel:
             die(f"'{SETTING}.path' in {config_file} must be a non-empty string")
-        path = prompt_path(config_dir, roots, config_in_jail, rel)
+        path = prompt_path(cfg_dir, roots, config_in_jail, rel)
         if not path.is_file():
             die(f"'{SETTING}.path' file not found: {rel}")
         try:
@@ -87,7 +89,7 @@ def resolve_segment(value: "object", config_file: str, config_dir: str,
         f'{{"path": ...}} object')
 
 
-def user_prompt(data: "dict", config_file: str, config_dir: str,
+def user_prompt(data: "dict", config_file: str, cfg_dir: str,
                 roots: "list[Root]", config_in_jail: bool) -> "str | None":
     """Resolve the project-supplied prompt text, or None when unset.
 
@@ -101,31 +103,33 @@ def user_prompt(data: "dict", config_file: str, config_dir: str,
     if value is None:
         return None
     if isinstance(value, list):
-        segments = [resolve_segment(v, config_file, config_dir, roots,
+        segments = [resolve_segment(v, config_file, cfg_dir, roots,
                                     config_in_jail) for v in value]
         return "\n\n".join(segments)
     if isinstance(value, (str, dict)):
-        return resolve_segment(value, config_file, config_dir, roots,
+        return resolve_segment(value, config_file, cfg_dir, roots,
                                config_in_jail)
     die(f"'{SETTING}' in {config_file} must be a string, a "
         f'{{"path": ...}} object, or a list of these')
 
 
-def roots_segment(roots: "list[Root]") -> str:
+def roots_segment(roots: "list[Root]", workdir: str) -> str:
     """A prompt segment telling the agent its working dir and project roots.
 
-    The container's working directory is always /workspace; each jail root is
-    bind-mounted beneath it at /workspace<host path>, so the agent needs the
-    list to know where its project actually lives.
+    The agent starts in `workdir` (the config file's directory under /workspace);
+    each jail root is bind-mounted under /workspace at /workspace<host path>, so
+    the agent needs the list to know where its project actually lives — its
+    working directory is not necessarily one of the mounted roots.
     """
     lines = [
         "# Project roots",
         "",
-        "Your working directory is `/workspace`. The directories you work in "
-        "are bind-mounted read-write beneath it, mirroring their host paths:",
+        f"Your working directory is `{workdir}`. The directories you work in "
+        "are bind-mounted read-write under `/workspace`, mirroring their host "
+        "paths:",
         "",
     ]
-    lines += [f"- `/workspace{r.dir}`" for r in roots]
+    lines += [f"- `{container_path(r.dir)}`" for r in roots]
     lines += [
         "",
         "Other paths under `/workspace`, and the rest of the container "
@@ -135,15 +139,16 @@ def roots_segment(roots: "list[Root]") -> str:
 
 
 def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
-          config_in_jail: bool) -> str:
+          config_in_jail: bool, workdir: str) -> str:
     """Merge the base jail prompt, the runtime roots, and the project prompt.
 
     In order: the base jail prompt, the generated project-roots section, then
     the project's own system_prompt, separated by blank lines. With no project
-    prompt the first two still pass through.
+    prompt the first two still pass through. `workdir` is the container working
+    directory the agent starts in.
     """
-    config_dir = str(Path(config_file).resolve().parent)
-    extra = user_prompt(data, config_file, config_dir, roots, config_in_jail)
-    parts = [p.strip("\n") for p in (base, roots_segment(roots), extra)
+    extra = user_prompt(data, config_file, config_dir(config_file), roots,
+                        config_in_jail)
+    parts = [p.strip("\n") for p in (base, roots_segment(roots, workdir), extra)
              if p and p.strip()]
     return "\n\n".join(parts)

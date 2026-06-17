@@ -21,7 +21,7 @@ path to it and cannot un-empty the masks.
 import json
 from pathlib import Path, PurePosixPath
 
-from jail_config import Root, die, resolve_in_root
+from jail_config import Root, container_path, die, resolve_in_root
 
 # Per-root array keys recognised in a roots entry. Each holds a list of paths
 # relative to that root.
@@ -144,14 +144,23 @@ def ensure_empty_mask() -> None:
         die(f"could not create mask file {path}: {e}")
 
 
+def _yaml_path(value: str) -> str:
+    """A host/container path as a YAML scalar for the override document.
+
+    json.dumps gives a safely-quoted string (handles spaces, quotes, control
+    chars); doubling `$` to `$$` stops docker compose from interpolating a
+    literal dollar in the path — compose interpolates every -f file it merges
+    (the piped override included) and `$$` is its escape for a literal `$`.
+    """
+    return json.dumps(value, ensure_ascii=False).replace("$", "$$")
+
+
 def _bind_stanza(source: str, target: str, read_only: bool) -> "list[str]":
     """A docker compose bind-mount stanza, read-write unless `read_only`."""
-    src = json.dumps(source, ensure_ascii=False)
-    tgt = json.dumps(target, ensure_ascii=False)
     lines = [
         "      - type: bind",
-        f"        source: {src}",
-        f"        target: {tgt}",
+        f"        source: {_yaml_path(source)}",
+        f"        target: {_yaml_path(target)}",
     ]
     if read_only:
         lines.append("        read_only: true")
@@ -164,21 +173,23 @@ def _bind_stanza(source: str, target: str, read_only: bool) -> "list[str]":
 
 def _rw_bind(root_dir: str) -> "list[str]":
     """The read-write bind that mounts a jail root into the container."""
-    return _bind_stanza(root_dir, f"/workspace{root_dir}", read_only=False)
+    return _bind_stanza(root_dir, container_path(root_dir), read_only=False)
 
 
 def _mask_volumes(mounts: "list[tuple[str, str]]", root_dir: str,
-                  mask_absent: "set[str]") -> "tuple[list[str], bool]":
+                  mask_absent: "set[str]"
+                  ) -> "tuple[list[str], list[str]]":
     """Render one root's read_only/hidden mounts as compose volume entries.
 
-    Returns (lines, used_empty_mask); used_empty_mask is True when a hidden file
-    was masked with the shipped empty file, so the caller knows to create it. A
-    hidden path in `mask_absent` (the config-protection paths) is masked even
-    when it does not exist on the host; any other missing hidden path is a hard
-    error (almost always a typo, and skipping it would leave a secret unmasked).
+    Returns (lines, seeds). A hidden path in `mask_absent` (the config-protection
+    paths) is masked even when it does not exist on the host; any other missing
+    hidden path is a hard error (almost always a typo, and skipping it would
+    leave a secret unmasked). `seeds` lists the host paths of those absent
+    config-protection files: the caller seeds each with `{}` before compose runs
+    (see seeds note in the hidden branch).
     """
     volumes: "list[str]" = []
-    used_empty_mask = False
+    seeds: "list[str]" = []
     for rel, mode in mounts:
         # Refuse a path that escapes the root via a symlink before we bind it;
         # otherwise a `read_only` symlink could expose a host file to the agent
@@ -186,7 +197,7 @@ def _mask_volumes(mounts: "list[tuple[str, str]]", root_dir: str,
         # already rejected at parse time.)
         resolve_in_root(root_dir, rel, f"{mode} path")
         source = f"{root_dir}/{rel}"
-        target = f"/workspace{root_dir}/{rel}"
+        target = container_path(f"{root_dir}/{rel}")
         host = Path(source)
         if mode == "read_only":
             if not host.exists():
@@ -201,10 +212,9 @@ def _mask_volumes(mounts: "list[tuple[str, str]]", root_dir: str,
             # so each mask is isolated and nothing persists across jails or
             # runs. (A tmpfs can't be made read-only through compose, and
             # tmpfs-mode is ignored when mounted over an existing directory.)
-            tgt = json.dumps(target, ensure_ascii=False)
             volumes += [
                 "      - type: volume",
-                f"        target: {tgt}",
+                f"        target: {_yaml_path(target)}",
                 "        read_only: true",
                 "        volume:",
                 "          nocopy: true",
@@ -216,36 +226,65 @@ def _mask_volumes(mounts: "list[tuple[str, str]]", root_dir: str,
             # rather than silently swallowed the way /dev/null swallowed them.
             # A config-protection path is masked even while absent, so the agent
             # cannot create it.
-            used_empty_mask = True
+            if not host.exists():
+                # The root is a rw bind, so docker materialises this read-only
+                # mask's bind target as a file in the real directory. Left as the
+                # 0-byte file docker creates, it is invalid JSON that makes the
+                # next run from here die in read_config; seeding it with `{}`
+                # first leaves a valid, default config behind instead.
+                seeds.append(source)
             volumes += _bind_stanza(str(SCRIPT_DIR / EMPTY_MASK), target,
                                     read_only=True)
         else:
             die(f"hidden path not found in the jail: {rel}")
-    return volumes, used_empty_mask
+    return volumes, seeds
 
 
-def override(roots: "list[Root]",
-             config_class: "tuple[str, str] | None") -> "tuple[str, bool]":
+def seed_masked_configs(paths: "list[str]") -> None:
+    """Best-effort seed of each absent, about-to-be-masked config with `{}`.
+
+    Masking an absent config makes docker materialise the bind target in the
+    rw-bound root, i.e. in the real host directory. Pre-seeding `{}` leaves a
+    valid, default config there instead of the 0-byte file docker would
+    otherwise create. This is only a courtesy on top of docker's own
+    materialisation: when the seed can't be written (an unwritable root, a
+    missing parent dir) docker still creates the target itself, so we skip
+    rather than abort an otherwise-fine launch. Idempotent: only writes what is
+    still missing.
+    """
+    for path in paths:
+        p = Path(path)
+        if p.exists():
+            continue
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("{}\n")
+        except OSError:
+            continue  # docker materialises the target; the seed is optional
+
+
+def override(roots: "list[Root]", config_class: "tuple[str, str] | None"
+             ) -> "tuple[str, list[str]]":
     """Build the docker compose volume override: a rw bind + masks per root.
 
-    Returns (document, needs_mask). Side-effect-free: when needs_mask is True (a
-    hidden file is masked with the shipped empty file) the caller must
-    ensure_empty_mask() before compose runs, keeping host writes out of the
-    validation step.
+    Returns (document, seeds). Side-effect-free: before launching a container the
+    caller must ensure_empty_mask() (the shipped empty file the hidden-file masks
+    bind) and seed_masked_configs(seeds) (the absent config-protection files),
+    keeping host writes out of the validation step.
     """
     volumes: "list[str]" = []
-    needs_mask = False
+    seeds: "list[str]" = []
     for root in roots:
         volumes += _rw_bind(root.dir)
         requested, mask_absent = requested_for_root(root, config_class)
         tree = build_tree(requested)
         mounts: "list[tuple[str, str]]" = []
         resolve(tree, [], False, mounts)
-        lines, used = _mask_volumes(mounts, root.dir, mask_absent)
+        lines, root_seeds = _mask_volumes(mounts, root.dir, mask_absent)
         volumes += lines
-        needs_mask = needs_mask or used
+        seeds += root_seeds
     if not volumes:
-        return "", False
+        return "", []
     out: "list[str]" = ["services:", "  claude-jail:", "    volumes:"]
     out += volumes
-    return "\n".join(out) + "\n", needs_mask
+    return "\n".join(out) + "\n", seeds

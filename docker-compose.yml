@@ -39,7 +39,7 @@ services:
       - type: volume
         source: jail-tmp
         target: /tmp
-    working_dir: /workspace
+    working_dir: ${JAIL_WORKDIR:-/workspace}
 
   squid:
     image: claude-jail-squid

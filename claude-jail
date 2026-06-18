@@ -16,6 +16,7 @@ The generated mount override is never written to disk: it reaches
 `<(...)`), so the jail's mount policy can't be read off disk or tampered with.
 """
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -201,6 +202,19 @@ def jail_identity(config_path: str) -> "tuple[str, str]":
     return jail_id, project.lower()
 
 
+def egress_id_of(policy_key: str) -> str:
+    """A short, stable id for an egress policy, derived from build_acl.policy_key.
+
+    Folded into COMPOSE_PROJECT_NAME so the shared squid side-service is shared
+    only among runs with the *same* policy: two concurrent runs in one project
+    with different egress configs get separate proxies instead of silently
+    sharing whichever one started squid first. policy_key is canonical and
+    render-independent, so the id (and thus the proxy's identity) changes only
+    when the policy changes, never when the Squid fragment's formatting does.
+    """
+    return hashlib.sha256(policy_key.encode()).hexdigest()[:8]
+
+
 def container_workdir(config_path: str) -> str:
     """The container working directory: the config file's own directory, mounted.
 
@@ -238,13 +252,18 @@ def build_jail(user_flag: "str | None",
                                 config_path, roots, config_class is not None,
                                 workdir)
     jail_id, project = jail_identity(config_path)
+    squid_acl = build_acl.squid_rules(data, config_path)
+    egress_id = egress_id_of(build_acl.policy_key(data, config_path))
     environment = {
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
         "JAIL_WORKDIR": workdir,
-        "COMPOSE_PROJECT_NAME": project,
+        # Fold the egress policy into the proxy's identity (project name + its
+        # logs volume) so a differing policy never reuses another run's squid.
+        "COMPOSE_PROJECT_NAME": f"{project}-{egress_id}",
+        "JAIL_EGRESS_ID": egress_id,
         "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
-        "JAIL_SQUID_ACL": build_acl.squid_rules(data, config_path),
+        "JAIL_SQUID_ACL": squid_acl,
         **build_env.exports(data, config_path),
     }
     override, seeds = build_mounts.override(roots, config_class)

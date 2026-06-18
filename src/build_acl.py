@@ -3,7 +3,7 @@
 build_env.py owns the claude launch settings; this module owns the `egress` key —
 the per-project network egress policy. Squid is an implementation detail: the
 config speaks an abstract allow/deny vocabulary (a `default` policy plus an
-`allowed`/`denied` host list with `*.` wildcards), and squid_rules() converts it
+`allowed`/`denied` list of domains and IP/CIDRs), and squid_rules() converts it
 to a Squid http_access fragment so that syntax never leaks into the config. The
 launcher exports the fragment as JAIL_SQUID_ACL; docker-compose.yml forwards it
 into the squid container, whose entrypoint writes it to the file squid.conf
@@ -12,7 +12,19 @@ includes. die() (from jail_config) reports a malformed config.
 Egress is default-deny: with no `egress` key at all, only Anthropic's domains
 (*.anthropic.com and *.claude.com) are reachable. They are always allowed
 regardless of the configured policy, so the jail can always reach the API.
+
+A host pattern is either a domain or a CIDR:
+  - A domain is a registrable name of two or more DNS labels (an optional "*."
+    prefix is accepted as a synonym). It matches the domain AND every subdomain
+    (Squid's leading-dot dstdomain), so `example.com` also covers
+    `api.example.com`. A bare TLD or single label (`com`, `localhost`) is
+    rejected, so a pattern can never open a whole TLD.
+  - A CIDR (IPv4 or IPv6, e.g. `1.2.3.4/32`, `10.0.0.0/8`) matches that address
+    or range, via Squid's `dst`. The prefix must be explicit, the host bits
+    clear, and the prefix narrower than /0, so a bare IP or a typo'd prefix is
+    rejected rather than silently widened.
 """
+import ipaddress
 import re
 
 from jail_config import die
@@ -26,19 +38,47 @@ ALWAYS_ALLOW = (".anthropic.com", ".claude.com")
 
 EGRESS_KEYS = {"default", "allowed", "denied"}
 
-# A host pattern is dot-joined DNS labels (1-63 chars, no leading/trailing
-# hyphen), optionally prefixed with "*." for a subdomain wildcard. Matching this
-# is the security boundary: a list entry can only ever become a dstdomain token,
-# never smuggle whitespace, a newline, or an extra directive into squid.conf.
+# A domain is two or more dot-joined DNS labels (1-63 chars, no leading/trailing
+# hyphen); requiring >=2 labels keeps a pattern from ever being a bare TLD. An
+# optional "*." prefix is stripped before matching. Matching this is the security
+# boundary: a list entry can only ever become a dstdomain/dst token, never smuggle
+# whitespace, a newline, or an extra directive into squid.conf.
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-_HOST = re.compile(rf"\A{_LABEL}(?:\.{_LABEL})*\Z")
+_DOMAIN = re.compile(rf"\A{_LABEL}(?:\.{_LABEL})+\Z")
 
 
 def squid_rules(data: "dict", config_file: str) -> str:
     """The Squid http_access fragment for the egress policy (always non-empty)."""
+    default, domains, ips = _resolve(data, config_file)
+    if default == "deny":
+        return _deny_fragment(domains, ips)
+    return _allow_fragment(domains, ips)
+
+
+def policy_key(data: "dict", config_file: str) -> str:
+    """A canonical, render-independent digest of the egress policy.
+
+    Configs that resolve to the same policy map to the same string — {} and
+    {"egress": {"allowed": []}}, or two lists differing only in order or
+    duplicates — while genuinely different policies map to different strings.
+    Unlike the rendered Squid fragment, this does NOT change when squid_rules'
+    output *formatting* does, so the launcher can fold it into the shared proxy's
+    identity without that identity churning across cosmetic refactors of the
+    fragment (which would orphan running proxies and their logs volumes).
+    """
+    default, domains, ips = _resolve(data, config_file)
+    return "\n".join([default, *sorted(set(domains)), "", *sorted(set(ips))])
+
+
+def _resolve(data: "dict", config_file: str) -> "tuple[str, list[str], list[str]]":
+    """Validate the `egress` config and resolve it to (default, domains, ips).
+
+    domains/ips are the Squid dstdomain/dst tokens for the configured list — the
+    `allowed` list under default-deny, the `denied` list under default-allow.
+    """
     egress = data.get("egress")
     if egress is None:
-        return _deny_fragment([])  # default-deny: only ALWAYS_ALLOW is reachable
+        return "deny", [], []  # default-deny: only ALWAYS_ALLOW is reachable
     if not isinstance(egress, dict):
         die(f"'egress' in {config_file} must be an object")
     unknown = set(egress) - EGRESS_KEYS
@@ -52,64 +92,139 @@ def squid_rules(data: "dict", config_file: str) -> str:
         if "denied" in egress:
             die(f"'egress' in {config_file}: with default \"deny\", list permitted "
                 f"hosts under 'allowed' (a 'denied' list would have no effect)")
-        return _deny_fragment(_host_tokens(egress, "allowed", config_file))
+        return "deny", *_split_tokens(egress, "allowed", config_file)
     if "allowed" in egress:
         die(f"'egress' in {config_file}: with default \"allow\", list blocked "
             f"hosts under 'denied' (an 'allowed' list would have no effect)")
-    return _allow_fragment(_host_tokens(egress, "denied", config_file))
+    return "allow", *_split_tokens(egress, "denied", config_file)
 
 
-def _host_tokens(egress: "dict", key: str, config_file: str) -> "list[str]":
-    """Validate egress[key] as a host list and convert it to dstdomain tokens."""
+def _split_tokens(egress: "dict", key: str,
+                  config_file: str) -> "tuple[list[str], list[str]]":
+    """Validate egress[key] as a host list, split into (domain, ip) Squid tokens."""
     value = egress.get(key, [])
     if not isinstance(value, list):
         die(f"'egress.{key}' in {config_file} must be an array of host patterns")
-    return [_dstdomain_token(entry, config_file) for entry in value]
+    domains: "list[str]" = []
+    ips: "list[str]" = []
+    for entry in value:
+        is_ip, token = _classify(entry, config_file)
+        (ips if is_ip else domains).append(token)
+    return domains, ips
 
 
-def _dstdomain_token(entry: object, config_file: str) -> str:
-    """Validate one host pattern and return its Squid dstdomain token.
+def _classify(entry: object, config_file: str) -> "tuple[bool, str]":
+    """Validate one host pattern; return (is_ip, token).
 
-    `*.example.com` -> `.example.com` (Squid's leading dot matches the apex and
-    every subdomain); a plain `example.com` stays exact.
+    A CIDR with an explicit prefix (`1.2.3.4/32`, `10.0.0.0/8`, IPv6) becomes a
+    Squid `dst` token; a domain becomes a leading-dot `dstdomain` token matching
+    the apex and every subdomain. A `*.` prefix on a domain is an accepted
+    synonym. A bare IP without a prefix, `*.` on an IP/CIDR, a bare TLD/single
+    label, a CIDR with host bits set or a /0, or anything else is rejected.
     """
     if not isinstance(entry, str):
         die(f"egress host patterns in {config_file} must be strings; got {entry!r}")
     wildcard = entry.startswith("*.")
     host = entry[2:] if wildcard else entry
-    if not _HOST.match(host):
-        die(f"invalid egress host pattern in {config_file}: {entry!r} "
-            f"(expected 'example.com' or '*.example.com')")
-    return ("." + host) if wildcard else host
+    cidr = _cidr_token(host)
+    if cidr is not None or _is_ip_address(host):
+        if wildcard:
+            die(f"egress host pattern in {config_file} applies '*.' to an IP "
+                f"address: {entry!r}")
+        if cidr is None:
+            die(f"egress IP pattern in {config_file} must be a CIDR with an "
+                f"explicit prefix length (e.g. '1.2.3.4/32' or "
+                f"'2606:4700::/32'): {entry!r}")
+        return (True, cidr)
+    if not _DOMAIN.match(host):
+        die(f"invalid egress host pattern in {config_file}: {entry!r} (expected a "
+            f"domain like 'example.com' / '*.example.com', or a CIDR like "
+            f"'1.2.3.4/32' / '10.0.0.0/8')")
+    return (False, "." + host)
 
 
-def _deny_fragment(allowed_tokens: "list[str]") -> str:
-    """Allowlist fragment: only ALWAYS_ALLOW plus allowed_tokens get through."""
-    tokens = list(dict.fromkeys(ALWAYS_ALLOW + tuple(allowed_tokens)))
-    return "\n".join((
-        f"acl jail_allow dstdomain {' '.join(tokens)}",
-        "http_access allow localnet jail_allow",
-        "http_access deny all",
-    ))
+def _cidr_token(value: str) -> "str | None":
+    """Canonical Squid `dst` token for an explicit, well-formed CIDR, else None.
+
+    None means "not an explicit CIDR" so the caller rejects it: no `/prefix`,
+    host bits set (`1.2.3.4/24`), a /0 that would cover everything, or simply not
+    an address. strict=True is the teeth — a typo'd or over-broad prefix fails
+    here instead of being silently canonicalized to a wider range than written.
+    """
+    if "/" not in value:
+        return None
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        return None
+    if network.prefixlen == 0:
+        return None
+    return str(network)
 
 
-def _allow_fragment(denied_tokens: "list[str]") -> str:
-    """Denylist fragment: everything but denied_tokens passes; ALWAYS_ALLOW wins.
+def _is_ip_address(value: str) -> bool:
+    """True when value is a bare IP address with no prefix (IPv4 or IPv6)."""
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _group(acl_name: str, kind: str, tokens: "list[str]",
+           verb: str) -> "tuple[str, str] | tuple[()]":
+    """An (acl-definition, http_access) line pair for a token group, or () when empty.
+
+    Pairing the definition with its reference means an http_access line can never
+    name an acl that was dropped for being empty.
+    """
+    if not tokens:
+        return ()
+    return (f"acl {acl_name} {kind} {' '.join(tokens)}",
+            f"http_access {verb} localnet {acl_name}")
+
+
+def _fragment(groups: "list[tuple]", tail: "list[str]") -> str:
+    """Join all acl definitions, then their http_access lines, then `tail`.
+
+    Each group is a _group() pair or (); emitting every acl before any
+    http_access keeps each acl defined before Squid sees it referenced.
+    """
+    acls = [g[0] for g in groups if g]
+    accesses = [g[1] for g in groups if g]
+    return "\n".join([*acls, *accesses, *tail])
+
+
+def _deny_fragment(domain_tokens: "list[str]",
+                   ip_tokens: "list[str]") -> str:
+    """Allowlist fragment: only ALWAYS_ALLOW plus the listed hosts get through."""
+    domains = list(dict.fromkeys(ALWAYS_ALLOW + tuple(domain_tokens)))
+    ips = list(dict.fromkeys(ip_tokens))
+    return _fragment(
+        [_group("jail_allow_dom", "dstdomain", domains, "allow"),
+         _group("jail_allow_ip", "dst", ips, "allow")],
+        ["http_access deny all"],
+    )
+
+
+def _allow_fragment(domain_tokens: "list[str]",
+                    ip_tokens: "list[str]") -> str:
+    """Denylist fragment: everything but the listed hosts passes; ALWAYS_ALLOW wins.
 
     With nothing denied this is plain allow-localnet (ALWAYS_ALLOW is reachable
-    anyway). Otherwise ALWAYS_ALLOW is matched first so a denied wildcard that
+    anyway). Otherwise ALWAYS_ALLOW is matched first so a denied domain that
     happens to cover it cannot block the API.
     """
-    if not denied_tokens:
+    domains = list(dict.fromkeys(domain_tokens))
+    ips = list(dict.fromkeys(ip_tokens))
+    if not domains and not ips:
         return "\n".join((
             "http_access allow localnet",
             "http_access deny all",
         ))
-    return "\n".join((
-        f"acl jail_anthropic dstdomain {' '.join(ALWAYS_ALLOW)}",
-        f"acl jail_deny dstdomain {' '.join(denied_tokens)}",
-        "http_access allow localnet jail_anthropic",
-        "http_access deny localnet jail_deny",
-        "http_access allow localnet",
-        "http_access deny all",
-    ))
+    return _fragment(
+        [_group("jail_anthropic", "dstdomain", list(ALWAYS_ALLOW), "allow"),
+         _group("jail_deny_dom", "dstdomain", domains, "deny"),
+         _group("jail_deny_ip", "dst", ips, "deny")],
+        ["http_access allow localnet", "http_access deny all"],
+    )

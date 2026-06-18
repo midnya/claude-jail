@@ -92,6 +92,16 @@ class JailIdentityTests(JailTestCase):
         self.assertEqual(L.jail_identity("/"), ("root", "root"))
 
 
+class EgressIdTests(JailTestCase):
+    def test_short_stable_and_policy_specific(self):
+        a = L.egress_id_of("http_access allow localnet jail_allow_dom")
+        b = L.egress_id_of("http_access allow localnet jail_allow_dom")
+        c = L.egress_id_of("http_access allow localnet")
+        self.assertEqual(a, b)         # same policy -> shared proxy
+        self.assertNotEqual(a, c)      # different policy -> separate proxy
+        self.assertRegex(a, r"\A[0-9a-f]{8}\Z")
+
+
 class ContainerWorkdirTests(JailTestCase):
     def test_workdir_is_config_dir_under_workspace(self):
         d = self.tmpdir()

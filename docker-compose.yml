@@ -69,4 +69,4 @@ volumes:
   jail-tmp:
     name: claude-jail-tmp-${JAIL_ID}
   jail-squid-logs:
-    name: claude-jail-squid-logs-${JAIL_ID}
+    name: claude-jail-squid-logs-${JAIL_ID}-${JAIL_EGRESS_ID}

@@ -1,1 +1,7 @@
-{}
+{
+    "packages": {
+        "apt": [
+            "python3-yaml"
+        ]
+    }
+}

@@ -5,8 +5,9 @@
 
 Leading --user/--config are ours. The rest is a strict command — run (the
 default), build, down, logs, ps — that the launcher turns into a fixed
-`docker compose` invocation itself; arbitrary compose args are never forwarded
-except through the explicit `compose -- <args>` escape hatch. The jail is
+`docker compose` invocation itself, plus `prune`, a docker-image cleanup that
+sidesteps compose; arbitrary compose args are never forwarded except through
+the explicit `compose -- <args>` escape hatch. The jail is
 anchored on the config file (default ./.claude-jail.json, or --config): it lists
 the `roots` to bind-mount (or defaults to the config file's own directory).
 Config parsing lives in the src/ modules (resolve_user, build_prompt, build_env,
@@ -44,7 +45,7 @@ PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 # The strict command surface. Anything not naming one of these defaults to `run`
 # with the whole remainder treated as arguments for claude; `compose` is the
 # explicit escape hatch that forwards its args to docker compose verbatim.
-KNOWN_COMMANDS = ("run", "build", "down", "logs", "ps", "compose")
+KNOWN_COMMANDS = ("run", "build", "down", "logs", "ps", "prune", "compose")
 
 
 def parse_args(argv: "list[str]") -> argparse.Namespace:
@@ -79,7 +80,8 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
     )
     parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
-        help="run (default) | build | down | logs | ps | compose -- <args>; "
+        help="run (default) | build | down | logs | ps | prune | "
+             "compose -- <args>; "
              "args after the command are forwarded (to claude for run, "
              "verbatim to docker compose for compose)",
     )
@@ -180,6 +182,40 @@ def require_docker_compose() -> None:
             "(the legacy standalone docker-compose binary is not supported)")
 
 
+# The content-addressed package images build_packages.image_suffix mints:
+# claude-jail-<8 hex>. Anchored so it matches neither the base `claude-jail`
+# image nor the `claude-jail-squid` side service — only the per-package-set
+# variants that pile up as orphans when a project's `packages` list changes.
+_PACKAGE_IMAGE = re.compile(r"\Aclaude-jail-[0-9a-f]{8}\Z")
+
+
+def prune_images() -> int:
+    """Remove the content-addressed package images (claude-jail-<digest>).
+
+    A changed `packages` list mints a fresh claude-jail-<8 hex> image and leaves
+    the previous tag behind with no GC path; this reclaims them. The base
+    `claude-jail` image and the `claude-jail-squid` side service are left alone —
+    singletons that `build` refreshes, not accumulators. An image still used by a
+    live session is kept (docker refuses to remove it) and reported on its line.
+    """
+    try:
+        listed = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}"],
+            capture_output=True, text=True)
+    except OSError:
+        die("docker not found on PATH")
+    if listed.returncode != 0:
+        die("could not list docker images to prune")
+    names = sorted({repo for repo in listed.stdout.split()
+                    if _PACKAGE_IMAGE.match(repo)})
+    if not names:
+        print("No claude-jail package images to prune.")
+        return 0
+    print(f"Pruning {len(names)} claude-jail package image(s): "
+          f"{', '.join(names)}")
+    return subprocess.run(["docker", "image", "rm", *names]).returncode
+
+
 # `docker compose` global flags that consume the following token as their value;
 # every other token starting with "-" is a valueless global flag. Used by the
 # `compose` escape hatch to find the subcommand in its verbatim args even when
@@ -245,6 +281,11 @@ def resolve_command(command: str,
         # Read-only; the fixed subcommand can't be swapped for `run`, so the
         # trailing args (a service name, -f, ...) are safe to forward.
         return [command, *command_args], False, False
+    if command != "compose":
+        # Every KNOWN_COMMAND is handled above except prune, which main()
+        # dispatches before reaching here; anything else is a launcher bug, not
+        # a verbatim compose invocation, so fail loudly instead of misrouting it.
+        raise AssertionError(f"resolve_command: unhandled command {command!r}")
     # command == "compose": the explicit verbatim escape hatch.
     sub = compose_subcommand(command_args)
     if sub is None:
@@ -358,6 +399,14 @@ def ensure_user_config(home: Path, jail_user: str) -> None:
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
+    # prune is host-wide image cleanup that drives the bare `docker` CLI, not
+    # compose, and is anchored on no config: short-circuit before
+    # require_docker_compose() and any config/prompt work so it runs from
+    # anywhere — even on a host without the compose plugin.
+    if args.command == "prune":
+        if args.command_args:
+            die("prune accepts no arguments")
+        sys.exit(prune_images())
     require_docker_compose()
     if not PROMPT_FILE.is_file():
         die(f"base system prompt not found: {PROMPT_FILE}")

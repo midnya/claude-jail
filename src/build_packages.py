@@ -15,8 +15,8 @@ The image tag is content-addressed on the package set (claude-jail-<digest>, or
 plain claude-jail when empty) so two projects with different lists never share —
 and so never clobber — one image, the same way egress folds into the proxy's
 identity. A new or changed list is a new tag that compose builds on first use;
-the previous tag is left behind as an orphan (there is no GC path — `docker
-image prune` reclaims it), the same accepted cost as the egress-keyed volumes.
+the previous tag is left behind as an orphan (the launcher's `prune` command
+reclaims them), the same accepted cost as the egress-keyed volumes.
 
 Matching a package name is the security boundary: an entry can only ever become a
 bare token on the `apt-get install` line and a fragment of an image tag, never

@@ -58,6 +58,11 @@ class ParseArgsTests(JailTestCase):
         self.assertEqual(args.command, "logs")
         self.assertEqual(args.command_args, ["squid"])
 
+    def test_prune(self):
+        args = L.parse_args(["prune"])
+        self.assertEqual(args.command, "prune")
+        self.assertEqual(args.command_args, [])
+
     def test_compose_escape_hatch(self):
         args = L.parse_args(["-u", "me", "compose", "--", "ps", "-a"])
         self.assertEqual(args.command, "compose")
@@ -151,6 +156,13 @@ class ResolveCommandTests(JailTestCase):
             L.resolve_command("compose", [])
         with self.assertDies("compose needs"):
             L.resolve_command("compose", ["--progress", "plain"])
+
+    def test_unhandled_command_is_not_misrouted_to_compose(self):
+        # prune (and any future non-compose command) is dispatched in main()
+        # before reaching here; if it ever leaks through, fail loudly rather than
+        # silently treating it as a verbatim compose invocation.
+        with self.assertRaises(AssertionError):
+            L.resolve_command("prune", [])
 
 
 class ComposeSubcommandTests(JailTestCase):
@@ -265,6 +277,71 @@ class CleanupSideContainersTests(JailTestCase):
 
         with mock.patch.object(L.subprocess, "run", side_effect=fake_run):
             L.cleanup_side_containers(["docker", "compose"], "proj")
+
+
+class PruneImagesTests(JailTestCase):
+    def _prune(self, repos, rm_returncode=0):
+        """Run prune_images() against a fake `docker images` listing of `repos`."""
+        calls = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if cmd[:2] == ["docker", "images"]:
+                return mock.Mock(returncode=0, stdout="\n".join(repos) + "\n")
+            return mock.Mock(returncode=rm_returncode)
+
+        with mock.patch.object(L.subprocess, "run", side_effect=fake_run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = L.prune_images()
+        rm = [c for c in calls if c[:3] == ["docker", "image", "rm"]]
+        return rc, rm
+
+    def test_removes_only_digest_variants(self):
+        # The base image and the squid side service are left alone; only the
+        # claude-jail-<8 hex> package variants are removed, sorted/deduped.
+        rc, rm = self._prune([
+            "claude-jail", "claude-jail-squid", "node", "<none>",
+            "claude-jail-deadbeef", "claude-jail-0badf00d",
+        ])
+        self.assertEqual(len(rm), 1)
+        self.assertEqual(rm[0][3:],
+                         ["claude-jail-0badf00d", "claude-jail-deadbeef"])
+        self.assertEqual(rc, 0)
+
+    def test_noop_when_nothing_matches(self):
+        rc, rm = self._prune(["claude-jail", "claude-jail-squid", "node"])
+        self.assertEqual(rm, [])  # never invokes `docker image rm`
+        self.assertEqual(rc, 0)
+
+    def test_near_miss_names_are_left_alone(self):
+        # Not 8 hex: a too-short/too-long digest or a non-hex char must not match.
+        rc, rm = self._prune([
+            "claude-jail-deadbee",     # 7 chars
+            "claude-jail-deadbeeff",   # 9 chars
+            "claude-jail-deadbeeg",    # 'g' is not hex
+            "claude-jail-tmp-foo",
+        ])
+        self.assertEqual(rm, [])
+        self.assertEqual(rc, 0)
+
+    def test_propagates_rm_failure(self):
+        # A live session keeps its image (docker rm fails); the rc surfaces it.
+        rc, rm = self._prune(["claude-jail-deadbeef"], rm_returncode=1)
+        self.assertEqual(len(rm), 1)
+        self.assertEqual(rc, 1)
+
+    def test_dies_when_listing_fails(self):
+        with mock.patch.object(L.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout="")):
+            with self.assertDies("could not list"):
+                L.prune_images()
+
+    def test_dies_when_docker_missing(self):
+        # prune drives the bare `docker` CLI directly (no compose preflight), so
+        # an absent binary surfaces as a clean die, not a raw OSError traceback.
+        with mock.patch.object(L.subprocess, "run", side_effect=OSError):
+            with self.assertDies("docker not found"):
+                L.prune_images()
 
 
 class RunComposeTests(JailTestCase):

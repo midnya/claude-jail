@@ -3,13 +3,16 @@
 Run Claude Code inside a locked-down Docker container.
 
 Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).
+Requires Python 3, with no other dependencies.
 
 Still in active development; bug reports, feature requests, and PRs are most welcome!
 
 ## AI usage disclosure
 
 `claude-jail` has partly been built with `Claude` itself; my time is, bluntly, better spent elsewhere.
-Its .git has always been quarantined. Use at your own risk.
+Its .git has always been quarantined.
+
+Use at your own risk.
 
 ## Security model (so far)
 
@@ -67,6 +70,7 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
   claude-jail --user me compose -- logs -f squid
   claude-jail --user me compose -- run --rm -e FOO=bar claude
   ```
+- `prune`: remove the per-package-set images (`claude-jail-<digest>`; see `packages` configuration).
 
 With a `user` key set in the config, the `--user` flag can be omitted.
 
@@ -134,7 +138,7 @@ Available keys:
 - `packages`: extra packages to install into this jail's image, grouped by
   manager. Only `apt` is currently supported. Note that the package set is folded into the
   image tag, so changing the list builds a fresh image and leaves the previous
-  one behind.
+  one behind. Clean with `claude-jail prune`.
 - `system_prompts`: an extra system prompt, appended to the jail's built-in one.
   A segment is either inline text or a file path, and you may pass one or a list of them:
   - inline: `"system_prompts": "Prefer pnpm over npm in this repo."`

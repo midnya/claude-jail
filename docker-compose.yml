@@ -1,7 +1,10 @@
 services:
   claude:
-    image: claude-jail
-    build: ./docker/claude
+    image: claude-jail${JAIL_IMAGE_SUFFIX:-}
+    build:
+      context: ./docker/claude
+      args:
+        EXTRA_APT_PACKAGES: ${JAIL_APT_PACKAGES:-}
 
     networks:
       - jail-internal

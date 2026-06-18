@@ -21,10 +21,11 @@ in a writable root cannot redirect it at a host secret. For a config inside the
 jail the resolved file must additionally land inside one of the jail roots; for
 a `--config` outside the jail it is trusted and may live anywhere on the host.
 
-merge() returns the jail prompt, then a generated section naming the runtime
-project roots, then the project prompt, separated by blank lines. Calls die() on
-a malformed config, an unsafe path, a missing or empty prompt file, or a prompt
-segment containing a NUL byte (which cannot be placed in the environment).
+merge() returns the jail prompt, then generated sections naming the runtime
+project roots and any extra installed packages, then the project prompt,
+separated by blank lines. Calls die() on a malformed config, an unsafe path, a
+missing or empty prompt file, or a prompt segment containing a NUL byte (which
+cannot be placed in the environment).
 """
 from pathlib import Path
 
@@ -138,17 +139,38 @@ def roots_segment(roots: "list[Root]", workdir: str) -> str:
     return "\n".join(lines)
 
 
-def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
-          config_in_jail: bool, workdir: str) -> str:
-    """Merge the base jail prompt, the runtime roots, and the project prompt.
+def packages_segment(packages: "list[str]") -> str:
+    """A prompt segment naming the extra packages installed in this jail, or "".
 
-    In order: the base jail prompt, the generated project-roots section, then
+    The project's `packages.apt` are baked into the image, so telling the agent
+    they are available saves it rediscovering (or wrongly assuming the absence
+    of) them. Empty when none were requested, so merge() drops the section.
+    """
+    if not packages:
+        return ""
+    listed = ", ".join(f"`{p}`" for p in packages)
+    return "\n".join([
+        "# Installed packages",
+        "",
+        "These extra system packages have been installed in this sandbox at "
+        f"the project's request and are available to use: {listed}.",
+    ])
+
+
+def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
+          config_in_jail: bool, workdir: str,
+          packages: "list[str] | None" = None) -> str:
+    """Merge the base jail prompt, the runtime sections, and the project prompt.
+
+    In order: the base jail prompt, the generated project-roots section, the
+    generated installed-packages section (when `packages` is non-empty), then
     the project's own system_prompts, separated by blank lines. With no project
-    prompt the first two still pass through. `workdir` is the container working
-    directory the agent starts in.
+    prompt the generated sections still pass through. `workdir` is the container
+    working directory the agent starts in.
     """
     extra = user_prompt(data, config_file, config_dir(config_file), roots,
                         config_in_jail)
-    parts = [p.strip("\n") for p in (base, roots_segment(roots, workdir), extra)
-             if p and p.strip()]
+    sections = (base, roots_segment(roots, workdir),
+                packages_segment(packages or []), extra)
+    parts = [p.strip("\n") for p in sections if p and p.strip()]
     return "\n\n".join(parts)

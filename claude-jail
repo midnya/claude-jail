@@ -18,7 +18,6 @@ The generated mount override is never written to disk: it reaches
 `<(...)`), so the jail's mount policy can't be read off disk or tampered with.
 """
 import argparse
-import hashlib
 import os
 import re
 import subprocess
@@ -32,10 +31,12 @@ sys.path.insert(0, str(SCRIPT_DIR / "src"))
 import build_acl
 import build_env
 import build_mounts
+import build_packages
 import build_prompt
 import resolve_user
 from jail_config import (classify_config, config_dir, container_path, die,
-                         parse_roots, read_config, resolved_config)
+                         parse_roots, read_config, resolved_config,
+                         short_digest)
 
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
@@ -279,7 +280,7 @@ def egress_id_of(policy_key: str) -> str:
     render-independent, so the id (and thus the proxy's identity) changes only
     when the policy changes, never when the Squid fragment's formatting does.
     """
-    return hashlib.sha256(policy_key.encode()).hexdigest()[:8]
+    return short_digest(policy_key)
 
 
 def container_workdir(config_path: str) -> str:
@@ -315,9 +316,10 @@ def build_jail(user_flag: "str | None",
     roots = parse_roots(data, config_path)
     config_class = classify_config(roots, config_path)
     workdir = container_workdir(config_path)
+    packages = build_packages.parse(data, config_path)
     prompt = build_prompt.merge(PROMPT_FILE.read_text(encoding="utf-8"), data,
                                 config_path, roots, config_class is not None,
-                                workdir)
+                                workdir, packages)
     jail_id, project = jail_identity(config_path)
     squid_acl = build_acl.squid_rules(data, config_path)
     egress_id = egress_id_of(build_acl.policy_key(data, config_path))
@@ -331,6 +333,11 @@ def build_jail(user_flag: "str | None",
         "JAIL_EGRESS_ID": egress_id,
         "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
         "JAIL_SQUID_ACL": squid_acl,
+        # Extra apt packages, baked into the image at build time. The suffix
+        # content-addresses the tag so a differing package set gets its own image
+        # rather than clobbering the shared one (built on first use).
+        "JAIL_APT_PACKAGES": build_packages.build_arg(packages),
+        "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages),
         **build_env.exports(data, config_path),
     }
     override, seeds = build_mounts.override(roots, config_class)

@@ -110,6 +110,17 @@ class RootsSegmentTests(JailTestCase):
         self.assertIn(f"- `/workspace{b}`", out)
 
 
+class PackagesSegmentTests(JailTestCase):
+    def test_empty_when_no_packages(self):
+        self.assertEqual(bp.packages_segment([]), "")
+
+    def test_lists_packages(self):
+        out = bp.packages_segment(["jq", "ripgrep"])
+        self.assertIn("# Installed packages", out)
+        self.assertIn("`jq`", out)
+        self.assertIn("`ripgrep`", out)
+
+
 class MergeTests(JailTestCase):
     def test_base_and_roots_without_project_prompt(self):
         root = self.tmpdir()
@@ -127,3 +138,18 @@ class MergeTests(JailTestCase):
         # Each boundary is a real blank-line separator, not just concatenation.
         self.assertIn("BASE\n\n# Project roots", out)
         self.assertIn("\n\nEXTRA", out)
+
+    def test_packages_section_between_roots_and_extra(self):
+        root = self.tmpdir()
+        out = bp.merge("BASE", {"system_prompts": "EXTRA"}, "cfg.json",
+                       self.roots(root), True, "/workspace" + root, ["jq"])
+        self.assertLess(out.index("# Project roots"),
+                        out.index("# Installed packages"))
+        self.assertLess(out.index("# Installed packages"), out.index("EXTRA"))
+        self.assertIn("`jq`", out)
+
+    def test_no_packages_section_when_empty(self):
+        root = self.tmpdir()
+        out = bp.merge("BASE", {}, "cfg.json", self.roots(root), True,
+                       "/workspace" + root, [])
+        self.assertNotIn("# Installed packages", out)

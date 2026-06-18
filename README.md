@@ -89,6 +89,7 @@ Example:
   "default_mode": "plan",
   "system_prompts": { "path": "CLAUDE_JAIL_PROMPT.md" },
   "egress": { "default": "deny", "allowed": ["github.com", "pypi.org", "10.0.0.0/8"] },
+  "packages": { "apt": ["jq", "ripgrep"] },
   "roots": [
     {
       "path": ".",
@@ -130,6 +131,10 @@ Available keys:
     - a CIDR (`1.2.3.4/32`, `10.0.0.0/8`, IPv6 too) matches that address or
       range. A bare IP without a prefix is rejected — write `/32` (`/128` for IPv6).
   - `*.anthropic.com` and `*.claude.com` are always reachable, so the jail can always reach the API.
+- `packages`: extra packages to install into this jail's image, grouped by
+  manager. Only `apt` is currently supported. Note that the package set is folded into the
+  image tag, so changing the list builds a fresh image and leaves the previous
+  one behind.
 - `system_prompts`: an extra system prompt, appended to the jail's built-in one.
   A segment is either inline text or a file path, and you may pass one or a list of them:
   - inline: `"system_prompts": "Prefer pnpm over npm in this repo."`

@@ -55,6 +55,13 @@ RUN if [ -n "$CLAUDE_CODE_VERSION" ]; then \
 RUN mkdir -p /app/.claude /home/claude/.claude
 RUN chown -R claude /app /home/claude
 
+ARG EXTRA_APT_PACKAGES=""
+RUN if [ -n "$EXTRA_APT_PACKAGES" ]; then \
+        apt-get update && \
+        apt-get install -y $EXTRA_APT_PACKAGES && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY entrypoint.sh /usr/local/bin/claude-jail-entrypoint
 RUN chmod +x /usr/local/bin/claude-jail-entrypoint
 

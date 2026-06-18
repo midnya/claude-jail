@@ -6,14 +6,16 @@ small modules that each interpret their own slice of it — build_mounts.py
 (system_prompts) and resolve_user.py (user). This module is their single source
 of truth for the things they must agree on: how errors are reported, how the
 config is read and shape-checked, what counts as a shell-/compose-safe bare
-word, what the jail's roots are, and how a path is resolved without letting it
-escape those roots (including via symlinks).
+word, what the jail's roots are, how a path is resolved without letting it
+escape those roots (including via symlinks), and how a content key is reduced
+to a short, stable id.
 
 The config is anchored on the config file, not a CLI directory: `roots` lists
 the directories bind-mounted into the jail (each with its own read_only/hidden
 rules), defaulting to the directory containing the config file when absent. A
 root `path` is resolved relative to that directory.
 """
+import hashlib
 import json
 import os
 import re
@@ -35,7 +37,8 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # per-root only (under a `roots` entry); rejecting them — and any other unknown
 # key — at the top level turns a silently-ignored legacy config or a typo into a
 # hard error, instead of a jail that quietly drops the protections they meant.
-TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompts", "roots", "egress"}
+TOP_LEVEL_KEYS = {"user", "default_mode", "system_prompts", "roots", "egress",
+                  "packages"}
 
 
 def die(msg: str) -> "None":
@@ -100,6 +103,17 @@ def container_path(host_dir: str) -> str:
     directory and the project-roots prompt, so they cannot drift apart.
     """
     return f"/workspace{host_dir}"
+
+
+def short_digest(key: str) -> str:
+    """A short, stable hex id for a content key: the first 8 of its SHA-256.
+
+    The shared content-addressing primitive: the launcher folds an egress
+    policy into the proxy's identity with it (egress_id_of), and
+    build_packages.py folds a package set into the image tag (image_suffix).
+    Centralised here so the two cannot drift to different digest shapes.
+    """
+    return hashlib.sha256(key.encode()).hexdigest()[:8]
 
 
 class Root:

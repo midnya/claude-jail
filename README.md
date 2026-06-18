@@ -28,7 +28,7 @@ Its .git has always been quarantined. Use at your own risk.
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [docker compose args...]
+claude-jail [--user <name>] [--config <path>] [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
@@ -36,38 +36,44 @@ claude-jail [--user <name>] [--config <path>] [docker compose args...]
   created on first run. Use different names to keep separate identities/logins.
 - `--config <path>` (`-c`): the jail config file. Defaults to
   `./.claude-jail.json`.
-- `[docker compose args...]`: forwarded verbatim to `docker compose`. Use `--` to explicitely pass the rest of the command to compose.
+- `[COMMAND] [args...]`: one of the commands below. With no command, `run` is assumed.
 
 ## Commands
 
 Run from the directory that holds your `.claude-jail.json` (or point `-c` at it).
 
-Build the image (needed once, or when you wish to update the claude package):
+- `run`: starts an interactive session. Anything after the command is forwarded to `claude`;
+  use `--` to pass a leading-dash argument:
 
-```sh
-cd ~/code/myproject
-claude-jail --user me build --no-cache
-```
+  ```sh
+  claude-jail --user me                                # start a session
+  claude-jail --user me -- --help                      # -> claude --help
+  claude-jail --user me run -- -p "summarize this repo"
+  ```
 
-Start an interactive session:
+- `build`: build the sandbox images (needed once, or to update the claude
+  package / side-services). Accepts `--no-cache` and `--pull`:
 
-```sh
-claude-jail --user me run --rm claude
-```
+  ```sh
+  cd ~/code/myproject
+  claude-jail --user me build --no-cache
+  ```
 
-Any extra args after the service name are passed straight through to `claude`:
+- `down`: tear this project's containers down (volumes are kept; use `-v` to drop them too).
+- `logs [service]` / `ps`: inspect the containers (e.g. `logs squid`).
+- `compose -- <args>`: runs a raw `docker compose` command against the jail's project:
 
-```sh
-claude-jail --user me run --rm claude --help
-claude-jail --user me run --rm claude -p "summarize this repo"
-```
+  ```sh
+  claude-jail --user me compose -- logs -f squid
+  claude-jail --user me compose -- run --rm -e FOO=bar claude
+  ```
 
 With a `user` key set in the config, the `--user` flag can be omitted.
 
 `-c` lets you launch from anywhere:
 
 ```sh
-claude-jail -c ~/code/myproject/.claude-jail.json run --rm claude
+claude-jail -c ~/code/myproject/.claude-jail.json
 ```
 
 ## Configuration

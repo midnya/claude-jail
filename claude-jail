@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Launch Claude Code inside the claude-jail Docker sandbox.
 
-    claude-jail [--user NAME] [--config PATH] [docker compose args...]
+    claude-jail [--user NAME] [--config PATH] [COMMAND] [args...]
 
-Leading --user/--config are ours; everything else is forwarded to
-`docker compose`. The jail is anchored on the config file (default
-./.claude-jail.json, or --config): it lists the `roots` to bind-mount (or
-defaults to the config file's own directory). Config parsing lives in the src/
-modules (resolve_user, build_prompt, build_env, build_mounts, jail_config),
-imported and called in-process; their die() raises SystemExit, so a bad config
-aborts before any host state is touched.
+Leading --user/--config are ours. The rest is a strict command — run (the
+default), build, down, logs, ps — that the launcher turns into a fixed
+`docker compose` invocation itself; arbitrary compose args are never forwarded
+except through the explicit `compose -- <args>` escape hatch. The jail is
+anchored on the config file (default ./.claude-jail.json, or --config): it lists
+the `roots` to bind-mount (or defaults to the config file's own directory).
+Config parsing lives in the src/ modules (resolve_user, build_prompt, build_env,
+build_mounts, jail_config), imported and called in-process; their die() raises
+SystemExit, so a bad config aborts before any host state is touched.
 
 The generated mount override is never written to disk: it reaches
 `docker compose -f` through an in-memory pipe exposed as /dev/fd/N (the shell's
@@ -38,22 +40,30 @@ from jail_config import (classify_config, config_dir, container_path, die,
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 
+# The strict command surface. Anything not naming one of these defaults to `run`
+# with the whole remainder treated as arguments for claude; `compose` is the
+# explicit escape hatch that forwards its args to docker compose verbatim.
+KNOWN_COMMANDS = ("run", "build", "down", "logs", "ps", "compose")
+
 
 def parse_args(argv: "list[str]") -> argparse.Namespace:
-    """Parse the invocation.
+    """Parse the invocation into our flags plus a strict command.
 
-    Forwards everything after our flags to docker compose untouched. REMAINDER
-    stops claiming options at the first non-option token, so a compose
-    subcommand (run, build, up, ...) needs nothing special. A compose token that
-    *looks* like an option (a global flag such as --progress, or a container
-    flag like --rm) must be guarded with a -- separator, or argparse would
-    reject it as one of ours; that leading -- is then dropped before forwarding.
+    argparse owns the fiddly part — the -u/--user and -c/--config flags, in any
+    of their spaced, joined, or =value forms — and gathers the command and its
+    arguments into a REMAINDER. We then dispatch that list ourselves: the first
+    token, when it names one of KNOWN_COMMANDS, is the command; otherwise the
+    command defaults to `run` and the whole remainder becomes arguments for
+    claude. For run and compose — which forward their args to an external
+    parser — a single leading -- is dropped, which is how a leading-dash
+    argument reaches claude (`claude-jail -u me -- --help`): argparse rejects a
+    bare leading-dash token, so -- is the way to pass one through. The other
+    commands interpret their own args, so a stray -- stays and is rejected.
     """
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
         description="Launch Claude Code inside the claude-jail Docker sandbox.",
-        usage="%(prog)s [--user NAME] [--config PATH] "
-              "[--] [docker compose args...]",
+        usage="%(prog)s [--user NAME] [--config PATH] [COMMAND] [args...]",
     )
     parser.add_argument(
         "-u", "--user", metavar="NAME",
@@ -67,17 +77,27 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              "(or its own directory) become the jail",
     )
     parser.add_argument(
-        "compose_args", nargs=argparse.REMAINDER, metavar="...",
-        help="forwarded verbatim to docker compose; put -- before a compose "
-             "global flag such as --progress",
+        "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
+        help="run (default) | build | down | logs | ps | compose -- <args>; "
+             "args after the command are forwarded (to claude for run, "
+             "verbatim to docker compose for compose)",
     )
     args = parser.parse_args(argv)
     if args.user == "":
         parser.error("--user requires a non-empty value")
     if args.config == "":
         parser.error("--config requires a non-empty value")
-    if args.compose_args and args.compose_args[0] == "--":
-        args.compose_args = args.compose_args[1:]
+    rest = args.rest
+    if rest and rest[0] in KNOWN_COMMANDS:
+        args.command, cargs = rest[0], rest[1:]
+    else:
+        args.command, cargs = "run", rest
+    # The -- passthrough separator is meaningful only for the commands that hand
+    # their args to an external parser (claude via run, docker via compose);
+    # strip one leading occurrence there. Elsewhere a -- is a real argument.
+    if args.command in ("run", "compose") and cargs and cargs[0] == "--":
+        cargs = cargs[1:]
+    args.command_args = cargs
     return args
 
 
@@ -160,9 +180,11 @@ def require_docker_compose() -> None:
 
 
 # `docker compose` global flags that consume the following token as their value;
-# every other token starting with "-" is a valueless global flag. Used to find
-# the subcommand even when global flags precede it (e.g. `--progress plain run`).
-# It's a terrible solution to a silly problem, but heh.
+# every other token starting with "-" is a valueless global flag. Used by the
+# `compose` escape hatch to find the subcommand in its verbatim args even when
+# global flags precede it (e.g. `compose -- --progress plain run`), so we know
+# whether that raw command launches the jail. The strict commands know this
+# statically and never touch it. A terrible solution to a silly problem, but heh.
 _COMPOSE_VALUE_FLAGS = frozenset({
     "-f", "--file", "-p", "--project-name", "--profile", "--env-file",
     "--ansi", "--progress", "--project-directory", "--parallel",
@@ -181,7 +203,52 @@ def compose_subcommand(compose_args: "list[str]") -> "str | None":
         i += 1
     return None
 
-_LAUNCH_SUBCOMMANDS = frozenset({"run", "up", "create", "start", "restart"})
+_LAUNCH_SUBCOMMANDS = frozenset({"run", "up", "create", "start", "restart",
+                                 "watch"})
+
+
+def _reject_extra_flags(command: str, command_args: "list[str]",
+                        allowed: "tuple[str, ...]") -> None:
+    """die() unless every token in command_args is one of the allowed flags."""
+    for flag in command_args:
+        if flag not in allowed:
+            die(f"{command} accepts only {', '.join(allowed)}")
+
+
+def resolve_command(command: str,
+                    command_args: "list[str]") -> "tuple[list[str], bool, bool]":
+    """Turn a parsed strict command into a concrete `docker compose` arg list.
+
+    Returns (compose_args, launches, teardown): `launches` is True when the
+    command starts the jail container, so the caller prepares host state and
+    feeds the mount override; `teardown` is True only for a `run` (the strict
+    command, or the escape hatch invoking a run subcommand), so the caller
+    reference-counts and tears the side containers down afterwards. The escape
+    hatch's subcommand is parsed once, here, to decide both.
+
+    For `run`, the launch line is always `run --rm claude <args>`, so every
+    user-supplied token lands after the service name: it can only reach claude
+    (the entrypoint execs `claude "$@"`), never docker — that is what makes the
+    strict commands strict. The `compose` escape hatch deliberately forgoes this.
+    """
+    if command == "run":
+        return ["run", "--rm", "claude", *command_args], True, True
+    if command == "build":
+        # No service is named, so both images build.
+        _reject_extra_flags("build", command_args, ("--no-cache", "--pull"))
+        return ["build", *command_args], False, False
+    if command == "down":
+        _reject_extra_flags("down", command_args, ("-v", "--volumes"))
+        return ["down", "--timeout", "0", *command_args], False, False
+    if command in ("logs", "ps"):
+        # Read-only; the fixed subcommand can't be swapped for `run`, so the
+        # trailing args (a service name, -f, ...) are safe to forward.
+        return [command, *command_args], False, False
+    # command == "compose": the explicit verbatim escape hatch.
+    sub = compose_subcommand(command_args)
+    if sub is None:
+        die("compose needs a docker compose subcommand, e.g. `compose -- ps`")
+    return command_args, sub in _LAUNCH_SUBCOMMANDS, sub == "run"
 
 
 def jail_identity(config_path: str) -> "tuple[str, str]":
@@ -295,10 +362,11 @@ def main() -> None:
     os.environ.update(environment)
 
     base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
-    subcommand = compose_subcommand(args.compose_args)
-    # Only a subcommand that actually launches the jail container needs the host
-    # state the mounts consume (see _LAUNCH_SUBCOMMANDS).
-    if subcommand in _LAUNCH_SUBCOMMANDS:
+    compose_args, launches, teardown = resolve_command(args.command,
+                                                       args.command_args)
+    # Only a command that actually launches the jail container needs the host
+    # state the mounts consume — and the mount override itself.
+    if launches:
         home_env = os.environ.get("HOME")
         if not home_env:
             die("HOME is not set; cannot locate the per-user config directory")
@@ -307,8 +375,9 @@ def main() -> None:
             build_mounts.ensure_empty_mask()
         build_mounts.seed_masked_configs(seeds)
 
-    status = run_compose(base_cmd, args.compose_args, override)
-    if subcommand == "run":
+    status = run_compose(base_cmd, compose_args, override if launches else "")
+    # up / start / watch are left running deliberately, so they get no teardown.
+    if teardown:
         cleanup_side_containers(base_cmd, environment["COMPOSE_PROJECT_NAME"])
     sys.exit(status)
 

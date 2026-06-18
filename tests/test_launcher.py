@@ -10,29 +10,70 @@ L = load_launcher()
 
 
 class ParseArgsTests(JailTestCase):
-    def test_user_flag_and_remainder(self):
-        args = L.parse_args(["-u", "me", "run", "--rm", "svc"])
+    def test_default_command_is_run(self):
+        args = L.parse_args(["-u", "me"])
         self.assertEqual(args.user, "me")
         self.assertIsNone(args.config)
-        self.assertEqual(args.compose_args, ["run", "--rm", "svc"])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, [])
 
-    def test_bare_subcommand_without_our_flags(self):
+    def test_explicit_run_keeps_claude_args(self):
+        args = L.parse_args(["-u", "me", "run", "-p", "hi"])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["-p", "hi"])
+
+    def test_default_run_dashdash_passes_claude_args(self):
+        # No command word: the remainder is claude's, and -- lets a leading-dash
+        # arg through (argparse would otherwise reject it).
+        args = L.parse_args(["-u", "me", "--", "--help"])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["--help"])
+
+    def test_explicit_run_dashdash_stripped(self):
+        args = L.parse_args(["-u", "me", "run", "--", "--help"])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["--help"])
+
+    def test_dashdash_kept_for_strict_command(self):
+        # -- is a passthrough separator only for run/compose; on the other
+        # commands it stays an argument, so `down --` is rejected like `down x`.
+        args = L.parse_args(["-u", "me", "down", "--"])
+        self.assertEqual(args.command, "down")
+        self.assertEqual(args.command_args, ["--"])
+        with self.assertDies("down accepts only"):
+            L.resolve_command(args.command, args.command_args)
+
+    def test_build_with_flag(self):
+        args = L.parse_args(["-u", "me", "build", "--no-cache"])
+        self.assertEqual(args.command, "build")
+        self.assertEqual(args.command_args, ["--no-cache"])
+
+    def test_down(self):
+        args = L.parse_args(["-u", "me", "down"])
+        self.assertEqual(args.command, "down")
+        self.assertEqual(args.command_args, [])
+
+    def test_logs_takes_service(self):
+        args = L.parse_args(["-u", "me", "logs", "squid"])
+        self.assertEqual(args.command, "logs")
+        self.assertEqual(args.command_args, ["squid"])
+
+    def test_compose_escape_hatch(self):
+        args = L.parse_args(["-u", "me", "compose", "--", "ps", "-a"])
+        self.assertEqual(args.command, "compose")
+        self.assertEqual(args.command_args, ["ps", "-a"])
+
+    def test_command_without_our_flags(self):
         args = L.parse_args(["build", "--no-cache"])
         self.assertIsNone(args.user)
         self.assertIsNone(args.config)
-        self.assertEqual(args.compose_args, ["build", "--no-cache"])
-
-    def test_leading_dashdash_stripped(self):
-        args = L.parse_args(["-u", "me", "--", "--progress", "plain", "run"])
-        self.assertEqual(args.compose_args, ["--progress", "plain", "run"])
+        self.assertEqual(args.command, "build")
+        self.assertEqual(args.command_args, ["--no-cache"])
 
     def test_config_flag(self):
         args = L.parse_args(["--config", "/x/y.json", "build"])
         self.assertEqual(args.config, "/x/y.json")
-        self.assertEqual(args.compose_args, ["build"])
-
-    def test_no_compose_args(self):
-        self.assertEqual(L.parse_args(["-u", "me"]).compose_args, [])
+        self.assertEqual(args.command, "build")
 
     def test_empty_user_rejected(self):
         # argparse prints usage to stderr then exits 2; swallow the noise.
@@ -44,6 +85,72 @@ class ParseArgsTests(JailTestCase):
         with contextlib.redirect_stderr(io.StringIO()), \
                 self.assertRaises(SystemExit):
             L.parse_args(["--config", ""])
+
+
+class ResolveCommandTests(JailTestCase):
+    # resolve_command returns (compose_args, launches, teardown).
+    def test_run_builds_strict_launch_line(self):
+        # Every claude arg lands after the service name, so it can never be a
+        # docker run flag — the core safety property. A run always tears down.
+        self.assertEqual(
+            L.resolve_command("run", ["-p", "hi"]),
+            (["run", "--rm", "claude", "-p", "hi"], True, True),
+        )
+
+    def test_build_plain_and_flags(self):
+        # No service is named, so `docker compose build` builds both images.
+        self.assertEqual(L.resolve_command("build", []),
+                         (["build"], False, False))
+        self.assertEqual(
+            L.resolve_command("build", ["--no-cache", "--pull"]),
+            (["build", "--no-cache", "--pull"], False, False),
+        )
+
+    def test_build_unknown_flag_rejected(self):
+        with self.assertDies("build accepts only"):
+            L.resolve_command("build", ["-v", "/etc:/x"])
+
+    def test_down(self):
+        self.assertEqual(L.resolve_command("down", []),
+                         (["down", "--timeout", "0"], False, False))
+
+    def test_down_accepts_volumes(self):
+        self.assertEqual(L.resolve_command("down", ["-v"]),
+                         (["down", "--timeout", "0", "-v"], False, False))
+        self.assertEqual(L.resolve_command("down", ["--volumes"]),
+                         (["down", "--timeout", "0", "--volumes"], False, False))
+
+    def test_down_rejects_args(self):
+        with self.assertDies("down accepts only"):
+            L.resolve_command("down", ["claude"])
+
+    def test_logs_and_ps_forward_args_read_only(self):
+        self.assertEqual(L.resolve_command("logs", ["squid"]),
+                         (["logs", "squid"], False, False))
+        self.assertEqual(L.resolve_command("ps", []), (["ps"], False, False))
+
+    def test_compose_run_launches_and_tears_down(self):
+        self.assertEqual(
+            L.resolve_command("compose", ["run", "--rm", "claude"]),
+            (["run", "--rm", "claude"], True, True),
+        )
+        self.assertEqual(L.resolve_command("compose", ["ps"]),
+                         (["ps"], False, False))
+
+    def test_compose_up_and_watch_launch_without_teardown(self):
+        # up / start / watch start containers (so they need the override) but are
+        # left running deliberately, so they must NOT trigger the post-run
+        # teardown. This is the half the production comment calls out.
+        self.assertEqual(L.resolve_command("compose", ["up", "-d"]),
+                         (["up", "-d"], True, False))
+        self.assertEqual(L.resolve_command("compose", ["watch"]),
+                         (["watch"], True, False))
+
+    def test_compose_without_subcommand_dies(self):
+        with self.assertDies("compose needs"):
+            L.resolve_command("compose", [])
+        with self.assertDies("compose needs"):
+            L.resolve_command("compose", ["--progress", "plain"])
 
 
 class ComposeSubcommandTests(JailTestCase):

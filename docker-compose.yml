@@ -20,7 +20,11 @@ services:
       CLAUDE_CODE_ENABLE_TELEMETRY: 0
       CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: 1
       DISABLE_AUTOUPDATER: 1
+
       COLORTERM: truecolor
+      TERM: ${TERM:-xterm-256color}
+      TERM_PROGRAM: ${TERM_PROGRAM:-}
+      TERM_PROGRAM_VERSION: ${TERM_PROGRAM_VERSION:-}
 
       CLAUDE_APPEND_SYSTEM_PROMPT: ${CLAUDE_APPEND_SYSTEM_PROMPT:-}
       CLAUDE_JAIL_PERMISSION_MODE: ${CLAUDE_JAIL_PERMISSION_MODE:-}
@@ -87,11 +91,6 @@ services:
         source: jail-dns-logs
         target: /var/log/unbound
     healthcheck:
-      # Resolve an always-allowed name rather than just `localhost`: this proves
-      # the resolver actually answers allowed queries (forwarding/recursion
-      # works), so a blocked upstream or a broken allowlist fails loudly here
-      # instead of letting claude/squid start against a dead DNS layer.
-      # `+short | grep .` rejects REFUSED/SERVFAIL, which dig's exit code does not.
       test: ["CMD-SHELL",
              "dig +time=3 +tries=1 @127.0.0.1 anthropic.com NS +short | grep -q ."]
       interval: 5s

@@ -25,13 +25,17 @@ Use at your own risk.
   - The proxy filters egress by destination. The policy is
     **default-deny**: with no `egress` config, only `*.anthropic.com` and
     `*.claude.com` are reachable. Every request is logged to a per-jail volume.
+  - DNS resolution is forced through an [Unbound](https://www.nlnetlabs.nl/projects/unbound/)
+    resolver. It enforces the same deny/allow list as Squid's. Every lookup is logged
+    to a per-jail volume. For convenience, CNAMEs are followed even if not
+    explicitely allowed.
 
 ## Invocation
 
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [COMMAND] [args...]
+claude-jail [--user <name>] [--config <path>] [--subnet <cidr>] [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
@@ -39,6 +43,8 @@ claude-jail [--user <name>] [--config <path>] [COMMAND] [args...]
   created on first run. Use different names to keep separate identities/logins.
 - `--config <path>` (`-c`): the jail config file. Defaults to
   `./.claude-jail.json`.
+- `--subnet <cidr>`: override the jail's internal Docker subnet (e.g.
+  `10.123.45.0/24`). Must be a private (RFC1918) range, `/26` or larger.
 - `[COMMAND] [args...]`: one of the commands below. With no command, `run` is assumed.
 
 ## Commands
@@ -63,7 +69,8 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
   ```
 
 - `down`: tear this project's containers down (volumes are kept; use `-v` to drop them too).
-- `logs [service]` / `ps`: inspect the containers (e.g. `logs squid`).
+- `logs [service]` / `ps`: inspect the containers (e.g. `logs squid` for the HTTP
+  egress log, `logs dns` for the DNS query log).
 - `compose -- <args>`: runs a raw `docker compose` command against the jail's project:
 
   ```sh
@@ -121,7 +128,8 @@ Available keys:
     a read-only empty file.
 - `default_mode`: the permission mode Claude starts in, forwarded to
   `claude --permission-mode`.
-- `egress`: the network egress policy enforced by the Squid proxy. An object:
+- `egress`: the network egress policy, enforced by the Squid proxy (HTTP) and
+  the Unbound resolver (DNS). An object:
   - `default`: `"deny"` (the default) or `"allow"`.
   - With `default: "deny"`, `allowed` lists the hosts that may be reached;
     everything else is blocked. With `default: "allow"`, `denied` lists the hosts

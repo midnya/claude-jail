@@ -19,6 +19,7 @@ The generated mount override is never written to disk: it reaches
 `<(...)`), so the jail's mount policy can't be read off disk or tampered with.
 """
 import argparse
+import ipaddress
 import os
 import re
 import subprocess
@@ -79,6 +80,13 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              "(or its own directory) become the jail",
     )
     parser.add_argument(
+        "--subnet", metavar="CIDR",
+        help="override the jail's internal Docker subnet (default: derived "
+             "automatically); a host-specific knob, not a config key, since the "
+             "right value avoids this host's networks and the config is shared. "
+             "Like --user/--config, it must precede the command",
+    )
+    parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
         help="run (default) | build | down | logs | ps | prune | "
              "compose -- <args>; "
@@ -90,6 +98,8 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
         parser.error("--user requires a non-empty value")
     if args.config == "":
         parser.error("--config requires a non-empty value")
+    if args.subnet == "":
+        parser.error("--subnet requires a non-empty value")
     rest = args.rest
     if rest and rest[0] in KNOWN_COMMANDS:
         args.command, cargs = rest[0], rest[1:]
@@ -324,6 +334,68 @@ def egress_id_of(policy_key: str) -> str:
     return short_digest(policy_key)
 
 
+def dns_endpoint(project_name: str,
+                 subnet: "str | None" = None) -> "tuple[str, str]":
+    """A jail-internal subnet and the DNS service's fixed address within it.
+
+    claude and squid forward external resolution to the jail's Unbound via the
+    compose `dns:` setting, which takes an IP, not a service name; a fixed IP in
+    turn needs a user-defined subnet on the internal network. The resolver sits at
+    host offset 53 — `.53` for a conventional `.0`-based block, the obvious DNS
+    mnemonic; docker takes offset 1 as the gateway.
+
+    Without an override the subnet is derived from the compose project name
+    (already egress-policy-specific) so two concurrent jails usually land on
+    different subnets instead of colliding on one host-wide range. The derived
+    range carries only ~16 bits of entropy (two octets off the digest), so a
+    collision between two distinct concurrent jails is possible — not the
+    astronomically-unlikely odds of the full-path jail-identity slug — but it
+    surfaces loudly (docker refuses the overlapping pool at `up`) and --subnet is
+    the escape hatch. `subnet` (the --subnet flag) is also that override, for a
+    host whose networks the derived range would clash with; it is a flag, not a
+    config key, because the right value is host-specific and the config is shared.
+    The override must be private (RFC1918), since squid only trusts those as
+    localnet.
+    """
+    if subnet is None:
+        digest = short_digest(project_name)
+        octet1, octet2 = int(digest[0:2], 16), int(digest[2:4], 16)
+        return f"10.{octet1}.{octet2}.0/24", f"10.{octet1}.{octet2}.53"
+    network = _validate_subnet(subnet)
+    return str(network), str(network[53])
+
+
+# squid.conf trusts only RFC1918 as `localnet`; a --subnet outside these would
+# make every `http_access allow localnet` miss and silently deny all egress.
+_RFC1918 = tuple(ipaddress.ip_network(c) for c in
+                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def _validate_subnet(subnet: str) -> "ipaddress.IPv4Network":
+    """Validate a --subnet override, or die(): a private IPv4 CIDR with room for .53.
+
+    build_acl.parse_cidr does the strict parse (host bits set or garbage is
+    rejected there, shared with the egress CIDR check); here we add the
+    launcher's own policy — IPv4-only; RFC1918 (squid trusts only those as
+    localnet, so a public override would deny all egress; this also catches a /0,
+    a subnet of none of the RFC1918 blocks); and a network too small to hold a
+    non-broadcast offset-53 host, so the resolver address is always valid.
+    """
+    network = build_acl.parse_cidr(subnet)
+    if network is None:
+        die(f"--subnet {subnet!r} is not a valid CIDR")
+    if network.version != 4:
+        die(f"--subnet {subnet!r} must be IPv4 (the jail network is IPv4-only)")
+    if not any(network.subnet_of(block) for block in _RFC1918):
+        die(f"--subnet {subnet!r} must be a private (RFC1918) range — within "
+            f"10/8, 172.16/12 or 192.168/16 — because squid only trusts those "
+            f"as the jail's localnet")
+    if network.num_addresses <= 54:
+        die(f"--subnet {subnet!r} is too small for the resolver host; use a /26 "
+            f"or larger network")
+    return network
+
+
 def container_workdir(config_path: str) -> str:
     """The container working directory: the config file's own directory, mounted.
 
@@ -341,8 +413,8 @@ def container_workdir(config_path: str) -> str:
     return container_path(config_dir(config_path))
 
 
-def build_jail(user_flag: "str | None",
-               config_path: str) -> "tuple[dict, str, list[str]]":
+def build_jail(user_flag: "str | None", config_path: str,
+               subnet: "str | None" = None) -> "tuple[dict, str, list[str]]":
     """Validate the config and assemble the launch environment and mount override.
 
     Resolves the jail roots from the config (or its own directory), confines the
@@ -362,18 +434,27 @@ def build_jail(user_flag: "str | None",
                                 config_path, roots, config_class is not None,
                                 workdir, packages)
     jail_id, project = jail_identity(config_path)
-    squid_acl = build_acl.squid_rules(data, config_path)
-    egress_id = egress_id_of(build_acl.policy_key(data, config_path))
+    # One resolve of the egress policy renders the proxy ACL, the DNS ACL, and the
+    # canonical policy key together.
+    squid_acl, dns_acl, key = build_acl.render(data, config_path)
+    egress_id = egress_id_of(key)
+    # Fold the egress policy into the side services' identity (project name + their
+    # logs volumes) so a differing policy never reuses another run's squid or dns.
+    compose_project = f"{project}-{egress_id}"
+    dns_subnet, dns_ip = dns_endpoint(compose_project, subnet)
     environment = {
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
         "JAIL_WORKDIR": workdir,
-        # Fold the egress policy into the proxy's identity (project name + its
-        # logs volume) so a differing policy never reuses another run's squid.
-        "COMPOSE_PROJECT_NAME": f"{project}-{egress_id}",
+        "COMPOSE_PROJECT_NAME": compose_project,
         "JAIL_EGRESS_ID": egress_id,
         "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
         "JAIL_SQUID_ACL": squid_acl,
+        # The DNS allowlist (same policy, L3) plus the resolver's fixed address
+        # and the internal subnet that address requires.
+        "JAIL_DNS_ACL": dns_acl,
+        "JAIL_DNS_IP": dns_ip,
+        "JAIL_NET_SUBNET": dns_subnet,
         # Extra apt packages, baked into the image at build time. The suffix
         # content-addresses the tag so a differing package set gets its own image
         # rather than clobbering the shared one (built on first use).
@@ -412,7 +493,8 @@ def main() -> None:
         die(f"base system prompt not found: {PROMPT_FILE}")
 
     config_path = args.config or os.path.join(os.getcwd(), ".claude-jail.json")
-    environment, override, seeds = build_jail(args.user, config_path)
+    environment, override, seeds = build_jail(args.user, config_path,
+                                              args.subnet)
 
     # Config is valid; now apply the env.
     os.environ.update(environment)

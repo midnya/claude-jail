@@ -8,8 +8,12 @@ services:
 
     networks:
       - jail-internal
+    dns:
+      - ${JAIL_DNS_IP}
     depends_on:
       squid:
+        condition: service_healthy
+      dns:
         condition: service_healthy
 
     environment:
@@ -50,6 +54,11 @@ services:
     networks:
       - jail-internal
       - jail-egress
+    dns:
+      - ${JAIL_DNS_IP}
+    depends_on:
+      dns:
+        condition: service_healthy
     environment:
       JAIL_SQUID_ACL: ${JAIL_SQUID_ACL:-}
     volumes:
@@ -63,9 +72,39 @@ services:
       retries: 5
       start_period: 5s
 
+  dns:
+    image: claude-jail-unbound
+    build: ./docker/unbound
+    networks:
+      jail-internal:
+        ipv4_address: ${JAIL_DNS_IP}
+      jail-egress: {}
+    environment:
+      JAIL_DNS_ACL: ${JAIL_DNS_ACL:-}
+      JAIL_NET_SUBNET: ${JAIL_NET_SUBNET:-}
+    volumes:
+      - type: volume
+        source: jail-dns-logs
+        target: /var/log/unbound
+    healthcheck:
+      # Resolve an always-allowed name rather than just `localhost`: this proves
+      # the resolver actually answers allowed queries (forwarding/recursion
+      # works), so a blocked upstream or a broken allowlist fails loudly here
+      # instead of letting claude/squid start against a dead DNS layer.
+      # `+short | grep .` rejects REFUSED/SERVFAIL, which dig's exit code does not.
+      test: ["CMD-SHELL",
+             "dig +time=3 +tries=1 @127.0.0.1 anthropic.com NS +short | grep -q ."]
+      interval: 5s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+
 networks:
   jail-internal:
     internal: true
+    ipam:
+      config:
+        - subnet: ${JAIL_NET_SUBNET}
   jail-egress:
 
 volumes:
@@ -73,3 +112,5 @@ volumes:
     name: claude-jail-tmp-${JAIL_ID}
   jail-squid-logs:
     name: claude-jail-squid-logs-${JAIL_ID}-${JAIL_EGRESS_ID}
+  jail-dns-logs:
+    name: claude-jail-dns-logs-${JAIL_ID}-${JAIL_EGRESS_ID}

@@ -80,11 +80,25 @@ class ParseArgsTests(JailTestCase):
         self.assertEqual(args.config, "/x/y.json")
         self.assertEqual(args.command, "build")
 
+    def test_subnet_flag_precedes_command(self):
+        args = L.parse_args(["--subnet", "10.1.2.0/24", "run", "-p", "hi"])
+        self.assertEqual(args.subnet, "10.1.2.0/24")
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["-p", "hi"])
+
+    def test_subnet_defaults_to_none(self):
+        self.assertIsNone(L.parse_args(["-u", "me"]).subnet)
+
     def test_empty_user_rejected(self):
         # argparse prints usage to stderr then exits 2; swallow the noise.
         with contextlib.redirect_stderr(io.StringIO()), \
                 self.assertRaises(SystemExit):
             L.parse_args(["--user", ""])
+
+    def test_empty_subnet_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            L.parse_args(["--subnet", ""])
 
     def test_empty_config_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()), \
@@ -219,6 +233,44 @@ class EgressIdTests(JailTestCase):
         self.assertEqual(a, b)         # same policy -> shared proxy
         self.assertNotEqual(a, c)      # different policy -> separate proxy
         self.assertRegex(a, r"\A[0-9a-f]{8}\Z")
+
+
+class DnsEndpointTests(JailTestCase):
+    def test_stable_project_specific_and_well_formed(self):
+        import ipaddress
+        a_net, a_ip = L.dns_endpoint("proj-aabbccdd")
+        b_net, b_ip = L.dns_endpoint("proj-aabbccdd")
+        c_net, _ = L.dns_endpoint("other-11223344")
+        self.assertEqual((a_net, a_ip), (b_net, b_ip))   # same project -> same net
+        self.assertNotEqual(a_net, c_net)                # different project -> different net
+        # The resolver IP is the .53 host of its /24 subnet.
+        net = ipaddress.ip_network(a_net)
+        self.assertEqual(net.prefixlen, 24)
+        self.assertIn(ipaddress.ip_address(a_ip), net)
+        self.assertTrue(a_ip.endswith(".53"))
+
+    def test_subnet_override_used_with_dot53_host(self):
+        # An explicit subnet wins over the derived one; resolver keeps the .53.
+        self.assertEqual(L.dns_endpoint("proj", "10.123.45.0/24"),
+                         ("10.123.45.0/24", "10.123.45.53"))
+        self.assertEqual(L.dns_endpoint("proj", "172.20.0.0/22"),
+                         ("172.20.0.0/22", "172.20.0.53"))
+
+    def test_subnet_override_rejects_bad_values(self):
+        # (value, expected message fragment): pinning the reason keeps a
+        # regression that dies for the wrong cause from passing silently.
+        cases = [
+            ("nonsense", "not a valid CIDR"),
+            ("10.0.0.1/24", "not a valid CIDR"),  # host bits set (strict=True)
+            ("fd00::/64", "IPv4"),                # IPv6
+            ("8.8.8.0/24", "private"),            # public range
+            ("100.64.0.0/24", "private"),         # CGNAT, not RFC1918
+            ("0.0.0.0/0", "private"),             # /0, also not RFC1918
+            ("10.0.0.0/27", "too small"),         # RFC1918 but no room for .53
+        ]
+        for value, needle in cases:
+            with self.assertDies(needle):
+                L.dns_endpoint("proj", value)
 
 
 class ContainerWorkdirTests(JailTestCase):

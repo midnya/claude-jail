@@ -101,6 +101,99 @@ class DefaultAllowTests(JailTestCase):
                       rules)
 
 
+class DnsRulesTests(JailTestCase):
+    """dns_rules: the egress policy -> Unbound local-zone (L3) allowlist."""
+
+    def test_no_egress_refuses_all_but_anthropic(self):
+        rules = ba.dns_rules({}, "cfg")
+        self.assertEqual(rules, "\n".join((
+            'local-zone: "." refuse',
+            'local-zone: "anthropic.com." transparent',
+            'local-zone: "claude.com." transparent',
+        )))
+
+    def test_omitted_default_is_deny(self):
+        self.assertEqual(ba.dns_rules({"egress": {"allowed": []}}, "cfg"),
+                         ba.dns_rules({}, "cfg"))
+
+    def test_allowed_domains_become_transparent_zones(self):
+        # A bare host and a "*." host both become an apex+subdomain transparent
+        # zone that falls through to recursion; everything else stays refused.
+        rules = ba.dns_rules(
+            {"egress": {"default": "deny",
+                        "allowed": ["github.com", "*.example.com"]}}, "cfg")
+        self.assertEqual(rules, "\n".join((
+            'local-zone: "." refuse',
+            'local-zone: "anthropic.com." transparent',
+            'local-zone: "claude.com." transparent',
+            'local-zone: "github.com." transparent',
+            'local-zone: "example.com." transparent',
+        )))
+
+    def test_cidrs_produce_no_dns_rule(self):
+        # IP/CIDRs aren't names; the DNS layer ignores them (they stay Squid's
+        # dst job), so only the domain shows up here.
+        rules = ba.dns_rules(
+            {"egress": {"default": "deny",
+                        "allowed": ["1.2.3.4/32", "10.0.0.0/8", "github.com"]}},
+            "cfg")
+        self.assertEqual(rules, "\n".join((
+            'local-zone: "." refuse',
+            'local-zone: "anthropic.com." transparent',
+            'local-zone: "claude.com." transparent',
+            'local-zone: "github.com." transparent',
+        )))
+
+    def test_anthropic_deduped_when_listed(self):
+        rules = ba.dns_rules(
+            {"egress": {"default": "deny", "allowed": ["*.anthropic.com"]}},
+            "cfg")
+        self.assertEqual(rules.count('"anthropic.com."'), 1)
+
+    def test_allow_with_nothing_denied_is_empty(self):
+        # Default-allow with no denials leaves the resolver fully recursive.
+        self.assertEqual(ba.dns_rules({"egress": {"default": "allow"}}, "cfg"), "")
+
+    def test_denied_domains_become_always_refuse_zones(self):
+        rules = ba.dns_rules(
+            {"egress": {"default": "allow",
+                        "denied": ["*.tracker.example", "evil.com", "1.2.3.4/32"]}},
+            "cfg")
+        self.assertEqual(rules, "\n".join((
+            'local-zone: "tracker.example." always_refuse',
+            'local-zone: "evil.com." always_refuse',
+        )))
+
+    def test_denied_under_anthropic_stays_resolvable(self):
+        # Denying a name at or under an always-allowed apex must not refuse it,
+        # mirroring squid_rules letting jail_anthropic win first.
+        rules = ba.dns_rules(
+            {"egress": {"default": "allow",
+                        "denied": ["api.anthropic.com", "evil.com"]}}, "cfg")
+        self.assertEqual(rules, 'local-zone: "evil.com." always_refuse')
+
+
+class RenderTests(JailTestCase):
+    """render(): one resolve, all three artifacts, identical to the separate calls."""
+
+    def test_matches_individual_renderers(self):
+        for data in ({},
+                     {"egress": {"default": "deny",
+                                 "allowed": ["github.com", "*.example.com",
+                                             "1.2.3.4/32"]}},
+                     {"egress": {"default": "allow",
+                                 "denied": ["api.anthropic.com", "evil.com"]}},
+                     {"egress": {"default": "allow"}}):
+            self.assertEqual(
+                ba.render(data, "cfg"),
+                (ba.squid_rules(data, "cfg"), ba.dns_rules(data, "cfg"),
+                 ba.policy_key(data, "cfg")))
+
+    def test_render_validates(self):
+        with self.assertDies("must be an object"):
+            ba.render({"egress": "nope"}, "cfg")
+
+
 class ValidationTests(JailTestCase):
     def test_egress_not_object(self):
         with self.assertDies("must be an object"):

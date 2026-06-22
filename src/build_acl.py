@@ -1,13 +1,17 @@
-"""Build the Squid egress ACL fragment for a claude-jail run from .claude-jail.json.
+"""Build the egress ACL fragments for a claude-jail run from .claude-jail.json.
 
 build_env.py owns the claude launch settings; this module owns the `egress` key —
-the per-project network egress policy. Squid is an implementation detail: the
-config speaks an abstract allow/deny vocabulary (a `default` policy plus an
-`allowed`/`denied` list of domains and IP/CIDRs), and squid_rules() converts it
-to a Squid http_access fragment so that syntax never leaks into the config. The
-launcher exports the fragment as JAIL_SQUID_ACL; docker-compose.yml forwards it
-into the squid container, whose entrypoint writes it to the file squid.conf
-includes. die() (from jail_config) reports a malformed config.
+the per-project network egress policy. The config speaks an abstract allow/deny
+vocabulary (a `default` policy plus an `allowed`/`denied` list of domains and
+IP/CIDRs); this module renders it to two enforcement layers so neither tool's
+syntax leaks into the config:
+  - squid_rules() -> a Squid http_access fragment (the L7 HTTP allowlist).
+  - dns_rules()   -> an Unbound local-zone fragment (the L3 DNS allowlist that
+    refuses non-allowlisted names one query earlier, closing the DNS-tunnel
+    exfil channel an HTTP proxy can't see, and logging every lookup).
+The launcher exports them as JAIL_SQUID_ACL / JAIL_DNS_ACL; docker-compose.yml
+forwards each into its side container, whose entrypoint writes it to the file the
+base config includes. die() (from jail_config) reports a malformed config.
 
 Egress is default-deny: with no `egress` key at all, only Anthropic's domains
 (*.anthropic.com and *.claude.com) are reachable. They are always allowed
@@ -47,12 +51,48 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _DOMAIN = re.compile(rf"\A{_LABEL}(?:\.{_LABEL})+\Z")
 
 
+def render(data: "dict", config_file: str) -> "tuple[str, str, str]":
+    """Resolve the egress policy once and render every artifact a launch needs.
+
+    Returns (squid_acl, dns_acl, policy_key). A launch needs all three, and each
+    otherwise re-runs _resolve's parse + host-pattern classification over the same
+    config; resolving a single time here pays that cost once.
+    """
+    resolved = _resolve(data, config_file)
+    return _squid_rules(resolved), _dns_rules(resolved), _policy_key(resolved)
+
+
 def squid_rules(data: "dict", config_file: str) -> str:
     """The Squid http_access fragment for the egress policy (always non-empty)."""
-    default, domains, ips = _resolve(data, config_file)
+    return _squid_rules(_resolve(data, config_file))
+
+
+def _squid_rules(resolved: "tuple[str, list, list]") -> str:
+    default, domains, ips = resolved
     if default == "deny":
         return _deny_fragment(domains, ips)
     return _allow_fragment(domains, ips)
+
+
+def dns_rules(data: "dict", config_file: str) -> str:
+    """The Unbound local-zone fragment for the egress policy's DNS layer.
+
+    Gates the SAME allowlist as squid_rules, one query earlier: default-deny
+    refuses every name outside ALWAYS_ALLOW plus the allowed domains; default-allow
+    resolves everything and refuses the denied domains. Only domain tokens apply —
+    a CIDR is an address, not a name, so IP allow/deny stays Squid's `dst` job and
+    never appears here. Rendered into the file unbound.conf includes via
+    JAIL_DNS_ACL; may be empty (default-allow with nothing denied), which leaves
+    the resolver fully recursive.
+    """
+    return _dns_rules(_resolve(data, config_file))
+
+
+def _dns_rules(resolved: "tuple[str, list, list]") -> str:
+    default, domains, _ips = resolved
+    if default == "deny":
+        return _dns_deny_fragment(domains)
+    return _dns_allow_fragment(domains)
 
 
 def policy_key(data: "dict", config_file: str) -> str:
@@ -66,7 +106,11 @@ def policy_key(data: "dict", config_file: str) -> str:
     identity without that identity churning across cosmetic refactors of the
     fragment (which would orphan running proxies and their logs volumes).
     """
-    default, domains, ips = _resolve(data, config_file)
+    return _policy_key(_resolve(data, config_file))
+
+
+def _policy_key(resolved: "tuple[str, list, list]") -> str:
+    default, domains, ips = resolved
     return "\n".join([default, *sorted(set(domains)), "", *sorted(set(ips))])
 
 
@@ -143,21 +187,33 @@ def _classify(entry: object, config_file: str) -> "tuple[bool, str]":
     return (False, "." + host)
 
 
+def parse_cidr(value: str) -> "ipaddress.IPv4Network | ipaddress.IPv6Network | None":
+    """ip_network(value, strict=True), or None when value isn't a clean CIDR.
+
+    strict=True is the teeth — a typo'd or over-broad prefix or host bits set
+    (`1.2.3.4/24`) fails here instead of being silently canonicalized to a wider
+    range than written. This owns only the strict parse; the caller decides what
+    to make of the result (a /0, the address family, a minimum size), so the
+    egress ACL and the launcher's --subnet check share one notion of a
+    well-formed network rather than each spelling out its own try/except.
+    """
+    try:
+        return ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        return None
+
+
 def _cidr_token(value: str) -> "str | None":
     """Canonical Squid `dst` token for an explicit, well-formed CIDR, else None.
 
     None means "not an explicit CIDR" so the caller rejects it: no `/prefix`,
     host bits set (`1.2.3.4/24`), a /0 that would cover everything, or simply not
-    an address. strict=True is the teeth — a typo'd or over-broad prefix fails
-    here instead of being silently canonicalized to a wider range than written.
+    an address.
     """
     if "/" not in value:
         return None
-    try:
-        network = ipaddress.ip_network(value, strict=True)
-    except ValueError:
-        return None
-    if network.prefixlen == 0:
+    network = parse_cidr(value)
+    if network is None or network.prefixlen == 0:
         return None
     return str(network)
 
@@ -195,10 +251,20 @@ def _fragment(groups: "list[tuple]", tail: "list[str]") -> str:
     return "\n".join([*acls, *accesses, *tail])
 
 
+def _allowlist_domains(domain_tokens: "list[str]") -> "list[str]":
+    """ALWAYS_ALLOW plus the configured tokens, order-preserving and de-duplicated.
+
+    The effective default-deny domain set both enforcement layers render from:
+    Squid's dstdomain allow group and Unbound's transparent zones key on the
+    same names, so the union/dedup lives here rather than in each renderer.
+    """
+    return list(dict.fromkeys(ALWAYS_ALLOW + tuple(domain_tokens)))
+
+
 def _deny_fragment(domain_tokens: "list[str]",
                    ip_tokens: "list[str]") -> str:
     """Allowlist fragment: only ALWAYS_ALLOW plus the listed hosts get through."""
-    domains = list(dict.fromkeys(ALWAYS_ALLOW + tuple(domain_tokens)))
+    domains = _allowlist_domains(domain_tokens)
     ips = list(dict.fromkeys(ip_tokens))
     return _fragment(
         [_group("jail_allow_dom", "dstdomain", domains, "allow"),
@@ -228,3 +294,42 @@ def _allow_fragment(domain_tokens: "list[str]",
          _group("jail_deny_ip", "dst", ips, "deny")],
         ["http_access allow localnet", "http_access deny all"],
     )
+
+
+def _zone(domain_token: str) -> str:
+    """Unbound zone name for a leading-dot dstdomain token: '.x.com' -> 'x.com.'.
+
+    _classify and ALWAYS_ALLOW both yield a single-leading-dot token, so dropping
+    that dot and appending the root dot gives the FQDN zone Unbound's local-zone
+    keys on; its closest-enclosing-zone match is Squid dstdomain's apex+subdomain.
+    """
+    return domain_token[1:] + "."
+
+
+def _dns_deny_fragment(domain_tokens: "list[str]") -> str:
+    """Allowlist: refuse all names, then let ALWAYS_ALLOW plus the listed domains resolve.
+
+    `refuse` on the root is the default-deny; each allowed apex is a `transparent`
+    zone, which (being more specific) wins and falls through to normal resolution
+    for that domain and its subdomains. Always non-empty (ALWAYS_ALLOW is present).
+    """
+    domains = _allowlist_domains(domain_tokens)
+    return "\n".join([
+        'local-zone: "." refuse',
+        *(f'local-zone: "{_zone(d)}" transparent' for d in domains),
+    ])
+
+
+def _dns_allow_fragment(domain_tokens: "list[str]") -> str:
+    """Denylist: resolve everything, refuse the listed domains; ALWAYS_ALLOW is never refused.
+
+    With nothing denied this is empty (the resolver recurses for every name).
+    A denied domain at or under an ALWAYS_ALLOW apex is dropped so the API stays
+    resolvable, mirroring _allow_fragment matching jail_anthropic first. The
+    endswith test is exact because every token carries a single leading dot
+    (_classify / ALWAYS_ALLOW), so e.g. '.notanthropic.com' never matches
+    '.anthropic.com'.
+    """
+    domains = [d for d in dict.fromkeys(domain_tokens)
+               if not any(d.endswith(aa) for aa in ALWAYS_ALLOW)]
+    return "\n".join(f'local-zone: "{_zone(d)}" always_refuse' for d in domains)

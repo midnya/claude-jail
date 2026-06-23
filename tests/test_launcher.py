@@ -129,15 +129,19 @@ class ResolveCommandTests(JailTestCase):
         with self.assertDies("build accepts only"):
             L.resolve_command("build", ["-v", "/etc:/x"])
 
-    def test_down(self):
+    def test_down_activates_ide_profile(self):
+        # down must activate the ide profile so it reaps ide-relay/ide-host left
+        # by an earlier --ide run; a plain down skips inactive-profile services.
+        p = L.ide.profile_args()
         self.assertEqual(L.resolve_command("down", []),
-                         (["down", "--timeout", "0"], False, False))
+                         ([*p, "down", "--timeout", "0"], False, False))
 
     def test_down_accepts_volumes(self):
+        p = L.ide.profile_args()
         self.assertEqual(L.resolve_command("down", ["-v"]),
-                         (["down", "--timeout", "0", "-v"], False, False))
+                         ([*p, "down", "--timeout", "0", "-v"], False, False))
         self.assertEqual(L.resolve_command("down", ["--volumes"]),
-                         (["down", "--timeout", "0", "--volumes"], False, False))
+                         ([*p, "down", "--timeout", "0", "--volumes"], False, False))
 
     def test_down_rejects_args(self):
         with self.assertDies("down accepts only"):
@@ -310,7 +314,10 @@ class CleanupSideContainersTests(JailTestCase):
 
         with mock.patch.object(L.subprocess, "run", side_effect=fake_run):
             L.cleanup_side_containers(["docker", "compose"], "proj")
-        self.assertTrue(any("down" in c for c in calls))
+        # The reap activates the ide profile so it also removes ide-relay/ide-host.
+        down = next(c for c in calls if "down" in c)
+        self.assertEqual(down, ["docker", "compose", *L.ide.profile_args(),
+                                "down", "--timeout", "0"])
 
     def test_no_down_when_session_still_live(self):
         def fake_run(cmd, *a, **k):

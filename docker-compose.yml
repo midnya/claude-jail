@@ -28,13 +28,14 @@ services:
 
       CLAUDE_APPEND_SYSTEM_PROMPT: ${CLAUDE_APPEND_SYSTEM_PROMPT:-}
       CLAUDE_JAIL_PERMISSION_MODE: ${CLAUDE_JAIL_PERMISSION_MODE:-}
+      CLAUDE_CODE_IDE_HOST_OVERRIDE:
 
       HTTP_PROXY: http://squid:3128
       HTTPS_PROXY: http://squid:3128
       http_proxy: http://squid:3128
       https_proxy: http://squid:3128
-      NO_PROXY: localhost,127.0.0.1,::1
-      no_proxy: localhost,127.0.0.1,::1
+      NO_PROXY: localhost,127.0.0.1,::1${JAIL_IDE_NO_PROXY:-}
+      no_proxy: localhost,127.0.0.1,::1${JAIL_IDE_NO_PROXY:-}
     volumes:
       - type: bind
         source: ${HOME}/.claude-jail-${JAIL_USER}
@@ -97,6 +98,50 @@ services:
       timeout: 4s
       retries: 6
       start_period: 10s
+
+  ide-relay:
+    profiles: ["ide"]
+    image: claude-jail-ide
+    build:
+      context: .
+      dockerfile: docker/ide/Dockerfile
+    command: ["relay"]
+    networks:
+      - jail-internal
+      - jail-egress
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      JAIL_IDE_TARGET: ${JAIL_IDE_TARGET:-host.docker.internal}
+      JAIL_IDE_WORKSPACE: ${JAIL_IDE_WORKSPACE:-/workspace}
+      JAIL_NET_SUBNET: ${JAIL_NET_SUBNET:-}
+    volumes:
+      - type: bind
+        source: ${HOME}/.claude/ide
+        target: /host-ide
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOME}/.claude-jail-${JAIL_USER}/ide
+        target: /jail-ide
+        bind:
+          create_host_path: false
+
+  ide-host:
+    profiles: ["ide"]
+    image: claude-jail-ide
+    network_mode: host
+    command: ["forward"]
+    environment:
+      JAIL_IDE_GATEWAY: ${JAIL_IDE_GATEWAY:-}
+    volumes:
+      - type: bind
+        source: ${HOME}/.claude/ide
+        target: /host-ide
+        read_only: true
+        bind:
+          create_host_path: false
 
 networks:
   jail-internal:

@@ -12,7 +12,7 @@ Still in active development; bug reports, feature requests, and PRs are most wel
 `claude-jail` has partly been built with `Claude` itself; my time is, bluntly, better spent elsewhere.
 Its .git has always been quarantined.
 
-Use at your own risk.
+**Use at your own risk.**
 
 ## Security model (so far)
 
@@ -29,13 +29,21 @@ Use at your own risk.
     resolver. It enforces the same deny/allow list as Squid's. Every lookup is logged
     to a per-jail volume. For convenience, CNAMEs are followed even if not
     explicitely allowed.
+- Opt-in exception: `--ide` opens a channel from the sandbox to a running code
+  editor on the host.
+  - It watches the host's `~/.claude/ide` lockfile directory, therefore republishing
+    *every* advertised editor window.
+  - I have no trust in this feature. I will not spend time improving this feature.
+  - I don't know why you would want your IDE to be connected to a jailed
+    Claude, but I'm not your mom. Which means I can judge you for it.
+  - You have been properly warned.
 
 ## Invocation
 
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [--subnet <cidr>] [COMMAND] [args...]
+claude-jail [--user <name>] [--config <path>] [--subnet <cidr>] [--ide] [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
@@ -45,6 +53,8 @@ claude-jail [--user <name>] [--config <path>] [--subnet <cidr>] [COMMAND] [args.
   `./.claude-jail.json`.
 - `--subnet <cidr>`: override the jail's internal Docker subnet (e.g.
   `10.123.45.0/24`). Must be a private (RFC1918) range, `/26` or larger.
+- `--ide`: bridge the in-jail `/ide` to a code editor running on the host.
+  Off by default.
 - `[COMMAND] [args...]`: one of the commands below. With no command, `run` is assumed.
 
 ## Commands
@@ -70,7 +80,7 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
 
 - `down`: tear this project's containers down (volumes are kept; use `-v` to drop them too).
 - `logs [service]` / `ps`: inspect the containers (e.g. `logs squid` for the HTTP
-  egress log, `logs dns` for the DNS query log).
+  egress log, `logs dns` for the DNS query log, ...).
 - `compose -- <args>`: runs a raw `docker compose` command against the jail's project:
 
   ```sh

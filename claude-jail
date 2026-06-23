@@ -35,10 +35,11 @@ import build_env
 import build_mounts
 import build_packages
 import build_prompt
+import ide
 import resolve_user
 from jail_config import (classify_config, config_dir, container_path, die,
                          parse_roots, read_config, resolved_config,
-                         short_digest)
+                         short_digest, user_config_dir)
 
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
@@ -84,7 +85,13 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
         help="override the jail's internal Docker subnet (default: derived "
              "automatically); a host-specific knob, not a config key, since the "
              "right value avoids this host's networks and the config is shared. "
-             "Like --user/--config, it must precede the command",
+    )
+    parser.add_argument(
+        "--ide", action="store_true",
+        help="bridge the in-jail /ide to a code editor running on the host "
+             "(off by default). Opens a channel from the sandbox to your editor "
+             "(files, diffs, notebook execution). Obviously unsafe."
+             "Standard Linux host only for now",
     )
     parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
@@ -152,6 +159,18 @@ def run_compose(base_cmd: "list[str]", compose_args: "list[str]",
         writer.join(timeout=5)
 
 
+def teardown_args(extra: "list[str]" = ()) -> "list[str]":
+    """Compose args for a teardown that also reaps the profiled ide services.
+
+    The single owner of the `down` shape: every teardown — the strict `down` and
+    the post-run reap — routes through here, so the `--profile ide` activation
+    can't be forgotten at one site (a plain `down` skips inactive-profile
+    services, leaving ide-relay/ide-host running). The `compose` escape hatch is
+    deliberately verbatim and intentionally does not use this.
+    """
+    return [*ide.profile_args(), "down", "--timeout", "0", *extra]
+
+
 def cleanup_side_containers(base_cmd: "list[str]", project: str) -> None:
     """Tear side containers down, but only when no other live session shares this project.
 
@@ -172,7 +191,9 @@ def cleanup_side_containers(base_cmd: "list[str]", project: str) -> None:
     except OSError:
         last_session = False
     if last_session:
-        subprocess.run([*base_cmd, "down", "--timeout", "0"])
+        # teardown_args activates the ide profile so the reap also removes any
+        # ide-relay/ide-host (down skips services whose profile is inactive).
+        subprocess.run([*base_cmd, *teardown_args()])
 
 
 def require_docker_compose() -> None:
@@ -286,7 +307,10 @@ def resolve_command(command: str,
         return ["build", *command_args], False, False
     if command == "down":
         _reject_extra_flags("down", command_args, ("-v", "--volumes"))
-        return ["down", "--timeout", "0", *command_args], False, False
+        # teardown_args activates the ide profile so down reaps any ide-relay/
+        # ide-host left by an earlier --ide run; a plain down skips inactive-
+        # profile services.
+        return teardown_args(command_args), False, False
     if command in ("logs", "ps"):
         # Read-only; the fixed subcommand can't be swapped for `run`, so the
         # trailing args (a service name, -f, ...) are safe to forward.
@@ -468,7 +492,7 @@ def build_jail(user_flag: "str | None", config_path: str,
 
 def ensure_user_config(home: Path, jail_user: str) -> None:
     """Create the per-user config dir/file on the host if they don't exist."""
-    user_dir = home / f".claude-jail-{jail_user}"
+    user_dir = user_config_dir(home, jail_user)
     user_file = home / f".claude-jail-{jail_user}.json"
     try:
         user_dir.mkdir(parents=True, exist_ok=True)
@@ -495,15 +519,32 @@ def main() -> None:
     config_path = args.config or os.path.join(os.getcwd(), ".claude-jail.json")
     environment, override, seeds = build_jail(args.user, config_path,
                                               args.subnet)
+    # The opt-in IDE bridge is wholly owned by the `ide` package: its env
+    # additions point the in-jail CLI at the relay; everything else (the host
+    # helper, the lockfile mirror dir) lives behind start()/stop() below.
+    # Dropping these few lines removes the feature. COMPOSE_PROFILES is pinned
+    # here (the single owner — `ide.environment()` deliberately does not set it)
+    # either way, so an inherited value from the shell can't silently activate
+    # the bridge on a default run.
+    environment["COMPOSE_PROFILES"] = ide.PROFILE if args.ide else ""
+    if args.ide:
+        environment.update(ide.environment())
 
     # Config is valid; now apply the env.
     os.environ.update(environment)
+    if not args.ide:
+        # The claude service passes CLAUDE_CODE_IDE_HOST_OVERRIDE through from
+        # this env (compose omits it when unset). On a non-ide run, drop any
+        # value inherited from the shell so a default jail can't be pointed at
+        # an unintended IDE host — the mirror of COMPOSE_PROFILES being pinned.
+        os.environ.pop("CLAUDE_CODE_IDE_HOST_OVERRIDE", None)
 
     base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
     compose_args, launches, teardown = resolve_command(args.command,
                                                        args.command_args)
     # Only a command that actually launches the jail container needs the host
     # state the mounts consume — and the mount override itself.
+    ide_mirror = None
     if launches:
         home_env = os.environ.get("HOME")
         if not home_env:
@@ -512,8 +553,23 @@ def main() -> None:
         if override:
             build_mounts.ensure_empty_mask()
         build_mounts.seed_masked_configs(seeds)
+        if args.ide:
+            ide_mirror = ide.prepare(Path(home_env), environment["JAIL_USER"])
+            # Skip the bring-up when the bridge can't reach the editor (non-Linux
+            # host, or no gateway): prepare() has already warned, and `up -d` would
+            # otherwise leave a dead ide-host behind while reporting success.
+            if ide.bridge_viable():
+                ide.start_services(base_cmd)
 
-    status = run_compose(base_cmd, compose_args, override if launches else "")
+    try:
+        status = run_compose(base_cmd, compose_args, override if launches else "")
+    finally:
+        # On teardown (a `run`), clear the lockfile mirror so a later /ide can't
+        # follow it to a dead relay; cleanup_side_containers below then reaps the
+        # ide-relay/ide-host containers. up/start/watch leave both the mirror and
+        # the containers running alongside claude, like the other side services.
+        if ide_mirror is not None and teardown:
+            ide.cleanup(ide_mirror)
     # up / start / watch are left running deliberately, so they get no teardown.
     if teardown:
         cleanup_side_containers(base_cmd, environment["COMPOSE_PROJECT_NAME"])

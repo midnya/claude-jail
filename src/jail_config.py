@@ -105,6 +105,16 @@ def container_path(host_dir: str) -> str:
     return f"/workspace{host_dir}"
 
 
+def user_config_dir(home: Path, jail_user: str) -> Path:
+    """The per-user config/state dir on the host: ~/.claude-jail-<user>.
+
+    The single source of this naming, so the launcher's ensure_user_config and
+    the ide bridge's mirror dir can't drift from the directory docker-compose
+    bind-mounts into the jail.
+    """
+    return home / f".claude-jail-{jail_user}"
+
+
 def short_digest(key: str) -> str:
     """A short, stable hex id for a content key: the first 8 of its SHA-256.
 

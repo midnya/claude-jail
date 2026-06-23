@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+*.pyc
+tests
+docker
+.claude
+.claude-jail.json
+README.md
+system-prompt.md

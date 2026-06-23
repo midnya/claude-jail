@@ -114,6 +114,15 @@ class ParseRootsTests(JailTestCase):
         self.assertEqual(roots[0].read_only, ["a"])
         self.assertEqual(roots[0].hidden, ["b"])
 
+    def test_read_only_root_itself_parses(self):
+        # "." is a valid read_only entry — it asks for a whole read-only root,
+        # so the parser must accept it (the mount layer interprets it).
+        d = self.tmpdir()
+        cfg = self._config_in(d, '{"roots": [{"path": ".", "read_only": ["."]}]}')
+        roots = jc.parse_roots(jc.read_config(cfg), cfg)
+        self.assertEqual(roots[0].read_only, ["."])
+        self.assertTrue(roots[0].read_only_all())
+
     def test_relative_resolved_against_config_dir(self):
         d = self.tmpdir()
         sub = self.mkdir(os.path.join(d, "nested"))
@@ -190,6 +199,27 @@ class ParseRootsTests(JailTestCase):
         cfg = self._config_in(d, '{"roots": [".", "child"]}')
         with self.assertDies("roots overlap"):
             jc.parse_roots(jc.read_config(cfg), cfg)
+
+
+class RootSelfTests(JailTestCase):
+    def test_names_root_itself(self):
+        for p in (".", "./", ".//.", "./."):
+            self.assertTrue(jc.names_root_itself(p), p)
+        for p in ("src", "a/b", "..", "../x", "/abs", ".git"):
+            self.assertFalse(jc.names_root_itself(p), p)
+
+    def test_read_only_all_true_for_root_entry(self):
+        self.assertTrue(jc.Root("/r", ["."], []).read_only_all())
+        self.assertTrue(jc.Root("/r", ["src", "./"], []).read_only_all())
+
+    def test_read_only_all_false_otherwise(self):
+        self.assertFalse(jc.Root("/r", [], []).read_only_all())
+        self.assertFalse(jc.Root("/r", ["src"], []).read_only_all())
+        # A "." under `hidden` does not make the root read-only.
+        self.assertFalse(jc.Root("/r", [], ["."]).read_only_all())
+        # An empty string is an invalid entry (requested_for_root die()s on it),
+        # not a request for a read-only root — the two must agree.
+        self.assertFalse(jc.Root("/r", [""], []).read_only_all())
 
 
 class ResolveInRootTests(JailTestCase):

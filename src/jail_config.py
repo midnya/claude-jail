@@ -126,12 +126,24 @@ def short_digest(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:8]
 
 
+def names_root_itself(rel: str) -> bool:
+    """True when a root-relative path refers to the root directory itself.
+
+    `.`, `./`, `.//.` etc. all reduce to no path components. A `read_only` entry
+    that names the root this way asks for the *whole* root to be read-only; the
+    rest of the path machinery still rejects an absolute path or one with `..`.
+    """
+    return not PurePosixPath(rel).parts
+
+
 class Root:
     """A jail root: a host directory and its per-root read_only/hidden lists.
 
     `dir` is the resolved (realpath) absolute directory; `read_only` and
     `hidden` are the raw, root-relative path lists from the config (validated
-    and expanded with the built-in defaults by build_mounts.py).
+    and expanded with the built-in defaults by build_mounts.py). A `read_only`
+    entry naming the root itself (`.`) means the whole root is read-only — see
+    read_only_all().
     """
     __slots__ = ("dir", "read_only", "hidden")
 
@@ -139,6 +151,18 @@ class Root:
         self.dir = dir
         self.read_only = read_only
         self.hidden = hidden
+
+    def read_only_all(self) -> bool:
+        """True when the whole root is read-only: a `read_only` entry names the
+        root itself (`.` / `./`). build_mounts.py then binds the root read-only
+        instead of read-write; build_prompt.py flags it to the agent.
+
+        Only a non-empty string counts, matching build_mounts.requested_for_root,
+        which rejects an empty entry rather than treating it as the root — so the
+        prompt and the mount layer never disagree about whether a root is
+        read-only."""
+        return any(names_root_itself(p) for p in self.read_only
+                   if isinstance(p, str) and p)
 
 
 def _inside(root: Path, target: Path) -> bool:

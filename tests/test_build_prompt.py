@@ -4,6 +4,7 @@ import os
 from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
 
 import build_prompt as bp
+from jail_config import Root
 
 
 class ResolveSegmentTests(JailTestCase):
@@ -108,6 +109,16 @@ class RootsSegmentTests(JailTestCase):
         self.assertIn("/workspace" + a, out)
         self.assertIn(f"- `/workspace{a}`", out)
         self.assertIn(f"- `/workspace{b}`", out)
+
+    def test_read_only_root_is_flagged(self):
+        a, b = self.tmpdir(), self.tmpdir()
+        out = bp.roots_segment([Root(a, ["."], []), Root(b, [], [])],
+                               "/workspace" + a)
+        self.assertIn(f"- `/workspace{a}` (read-only)", out)
+        # A read-write root carries no annotation: the bare line is present and
+        # the read-only suffix is not.
+        self.assertIn(f"- `/workspace{b}`\n", out + "\n")
+        self.assertNotIn(f"- `/workspace{b}` (read-only)", out)
 
 
 class PackagesSegmentTests(JailTestCase):

@@ -99,9 +99,6 @@ claude-jail -c ~/code/myproject/.claude-jail.json
 
 ## Configuration
 
-It defines the jail's **roots**, the directories
-bind-mounted read-write, each with its own filesystem rules.
-
 Example:
 
 ```json
@@ -117,14 +114,15 @@ Example:
       "read_only": ["config/secrets.yml", "production/"],
       "hidden": [".env", "private/notes"]
     },
-    "../shared-lib"
+    { "path": "../shared-lib", "read_only": ["."] },
+    "../scratch"
   ]
 }
 ```
 
 Available keys:
 - `user`: the config namespace. The `--user` flag overrides it; one of the two must be set.
-- `roots`: the directories to jail, each bind-mounted read-write at
+- `roots`: the directories to jail, each bind-mounted (read-write by default) at
   `/workspace/<abs path>`. A list whose entries are either a string path or an
   object `{ "path", "read_only", "hidden" }`. A relative `path` is resolved
   against the config file's directory; an absolute one is taken as-is. Omit
@@ -132,7 +130,8 @@ Available keys:
   - The session starts in the config file's directory, mounted under `/workspace`.
     Should the config's directory not be part of the roots, that directory will be empty.
   - `read_only` (per root): paths relative to that root, bind-mounted read-only.
-    Visible inside the jail but writes fail at the filesystem level.
+    Visible inside the jail but writes fail at the filesystem level. `"read_only": ["."]`
+    to make the whole root read-only.
   - `hidden` (per root): paths relative to that root, masked to empty. A hidden
     directory mounts as an empty read-only volume; a hidden file is masked with
     a read-only empty file.
@@ -184,6 +183,9 @@ Notes:
   the jail it is trusted and may live anywhere.
 - Per-root `read_only`/`hidden` paths must be relative and stay inside their
   root. When a path is listed under both, `hidden` wins.
+- A `read_only` entry of `"."` (the root itself) makes the whole root
+  read-only; the per-path `read_only` list and the always-on `.git` rule become
+  redundant and are dropped. `hidden` may not name the root itself.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
 - A missing or empty `system_prompts.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.

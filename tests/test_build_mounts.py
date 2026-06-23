@@ -54,9 +54,27 @@ class RequestedForRootTests(JailTestCase):
         with self.assertDies("read_only path must be relative to its root"):
             bm.requested_for_root(Root("/r", ["../x"], []), None)
 
-    def test_root_itself_rejected(self):
+    def test_hidden_root_itself_rejected(self):
         with self.assertDies("hidden path must not be the root itself"):
             bm.requested_for_root(Root("/r", [], ["."]), None)
+
+    def test_read_only_root_itself_drops_per_path_mounts(self):
+        # "." marks the whole root read-only, so the per-path read_only list
+        # (including the .git default) is dropped as redundant; hidden stays.
+        requested, _ = bm.requested_for_root(
+            Root("/r", ["."], []), None, read_only_all=True)
+        self.assertEqual(requested["read_only"], [])
+        self.assertEqual(requested["hidden"], [bm.CONFIG_NAME])
+
+    def test_read_only_root_drops_sibling_read_only(self):
+        requested, _ = bm.requested_for_root(
+            Root("/r", [".", "src"], []), None, read_only_all=True)
+        self.assertEqual(requested["read_only"], [])
+
+    def test_read_only_root_keeps_hidden(self):
+        requested, _ = bm.requested_for_root(
+            Root("/r", ["."], ["secret"]), None, read_only_all=True)
+        self.assertIn("secret", requested["hidden"])
 
 
 class TreeResolveTests(JailTestCase):
@@ -110,11 +128,16 @@ class BindStanzaTests(JailTestCase):
         lines = bm._bind_stanza("/s", "/t", read_only=True)
         self.assertIn("        read_only: true", lines)
 
-    def test_rw_bind_targets_workspace_mirror(self):
-        lines = bm._rw_bind("/host/proj")
+    def test_root_bind_targets_workspace_mirror(self):
+        lines = bm._root_bind("/host/proj")
         self.assertIn('        source: "/host/proj"', lines)
         self.assertIn('        target: "/workspace/host/proj"', lines)
         self.assertNotIn("        read_only: true", lines)
+
+    def test_root_bind_read_only_adds_flag(self):
+        lines = bm._root_bind("/host/proj", read_only=True)
+        self.assertIn('        source: "/host/proj"', lines)
+        self.assertIn("        read_only: true", lines)
 
 
 class MaskVolumesTests(JailTestCase):
@@ -157,6 +180,34 @@ class MaskVolumesTests(JailTestCase):
         volumes, seeds = bm._mask_volumes([(rel, "hidden")], root, {rel})
         self.assertIn(str(bm.SCRIPT_DIR / bm.EMPTY_MASK), "\n".join(volumes))
         self.assertEqual(seeds, [f"{root}/{rel}"])
+
+    def test_read_only_root_absent_config_not_masked_or_seeded(self):
+        # In a read-only root the bind already blocks planting, so an absent
+        # config-protection path is left alone (no mask, no host seed) — docker
+        # can't materialise a mask target inside a read-only bind anyway.
+        root = self.tmpdir()
+        rel = ".claude-jail.json"
+        volumes, seeds = bm._mask_volumes(
+            [(rel, "hidden")], root, {rel}, root_read_only=True)
+        self.assertEqual((volumes, seeds), ([], []))
+
+    def test_existing_config_masked_regardless_of_read_only(self):
+        # An existing config is always masked (the agent could otherwise read
+        # it) and never seeded. Masking an existing file is independent of the
+        # root_read_only flag (the read-only skip only applies to *absent*
+        # configs), so both flag values must produce the same result — asserting
+        # that keeps this test from being inert for the read-only branch.
+        root = self.tmpdir()
+        rel = ".claude-jail.json"
+        self.write(os.path.join(root, rel), "{}")
+        rw = bm._mask_volumes([(rel, "hidden")], root, {rel},
+                              root_read_only=False)
+        ro = bm._mask_volumes([(rel, "hidden")], root, {rel},
+                              root_read_only=True)
+        self.assertEqual(rw, ro)
+        volumes, seeds = ro
+        self.assertIn(str(bm.SCRIPT_DIR / bm.EMPTY_MASK), "\n".join(volumes))
+        self.assertEqual(seeds, [])
 
     def test_missing_hidden_path_is_an_error(self):
         root = self.tmpdir()
@@ -247,3 +298,54 @@ class OverrideTests(JailTestCase):
         root = self.tmpdir()
         document, _ = bm.override([Root(root, [], [])], None)
         self.assertNotIn(f'source: "{root}/.git"', document)
+
+    def test_whole_root_read_only_binds_root_read_only(self):
+        # `read_only: ["."]` binds the root itself read-only.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, ".git"))
+        document, _ = bm.override([Root(root, ["."], [])], None)
+        self.assertIn("\n".join(bm._root_bind(root, read_only=True)), document)
+        # The redundant per-path .git read_only bind is dropped.
+        self.assertNotIn(f'source: "{root}/.git"', document)
+
+    def test_whole_root_read_only_absent_config_not_seeded(self):
+        # A read-only root with no .claude-jail.json on disk neither seeds the
+        # host (the directory the user marked read-only stays untouched) nor
+        # emits a mask for the absent config.
+        root = self.tmpdir()
+        document, seeds = bm.override([Root(root, ["."], [])], None)
+        self.assertEqual(seeds, [])
+        self.assertNotIn(f'target: "/workspace{root}/{bm.CONFIG_NAME}"',
+                         document)
+
+    def test_whole_root_read_only_still_masks_hidden(self):
+        # A hidden path inside a read-only root is still masked to empty.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, "secret"))
+        document, _ = bm.override([Root(root, ["."], ["secret"])], None)
+        self.assertIn(f'target: "/workspace{root}/secret"', document)
+        self.assertIn("nocopy: true", document)
+
+    def test_whole_root_read_only_masks_active_config_inside(self):
+        # End-to-end: the active config (config_class) living inside a read-only
+        # root is masked at its own path and not seeded. Exercises the
+        # override -> requested_for_root(config_class[0]==root) ->
+        # _mask_volumes(root_read_only=True) wiring for an existing config.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, "sub"))
+        rel = os.path.join("sub", bm.CONFIG_NAME)
+        self.write(os.path.join(root, rel), '{"user": "x"}')
+        document, seeds = bm.override([Root(root, ["."], [])], (root, rel))
+        self.assertIn(f'target: "/workspace{root}/{rel}"', document)
+        self.assertEqual(seeds, [])
+
+    def test_whole_root_read_only_absent_active_config_not_masked(self):
+        # An absent active config inside a read-only root is neither masked nor
+        # seeded: the read-only bind blocks planting and docker can't
+        # materialise a mask target inside a read-only bind.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, "sub"))
+        rel = os.path.join("sub", bm.CONFIG_NAME)
+        document, seeds = bm.override([Root(root, ["."], [])], (root, rel))
+        self.assertEqual(seeds, [])
+        self.assertNotIn(f'target: "/workspace{root}/{rel}"', document)

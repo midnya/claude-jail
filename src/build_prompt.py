@@ -126,11 +126,15 @@ def roots_segment(roots: "list[Root]", workdir: str) -> str:
         "# Project roots",
         "",
         f"Your working directory is `{workdir}`. The directories you work in "
-        "are bind-mounted read-write under `/workspace`, mirroring their host "
-        "paths:",
+        "are bind-mounted under `/workspace` (read-write unless marked "
+        "read-only), mirroring their host paths:",
         "",
     ]
-    lines += [f"- `{container_path(r.dir)}`" for r in roots]
+    lines += [
+        f"- `{container_path(r.dir)}`" + (" (read-only)" if r.read_only_all()
+                                          else "")
+        for r in roots
+    ]
     lines += [
         "",
         "Other paths under `/workspace`, and the rest of the container "

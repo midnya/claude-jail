@@ -65,9 +65,9 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
   use `--` to pass a leading-dash argument:
 
   ```sh
-  claude-jail --user me                                # start a session
-  claude-jail --user me -- --help                      # -> claude --help
-  claude-jail --user me run -- -p "summarize this repo"
+  claude-jail                                 # start a session
+  claude-jail -- --help                       # -> claude --help
+  claude-jail run -- -p "summarize this repo"
   ```
 
 - `build`: build the sandbox images (needed once, or to update the claude
@@ -75,7 +75,7 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
 
   ```sh
   cd ~/code/myproject
-  claude-jail --user me build --no-cache
+  claude-jail build --no-cache
   ```
 
 - `down`: tear this project's containers down (volumes are kept; use `-v` to drop them too).
@@ -84,12 +84,10 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
 - `compose -- <args>`: runs a raw `docker compose` command against the jail's project:
 
   ```sh
-  claude-jail --user me compose -- logs -f squid
-  claude-jail --user me compose -- run --rm -e FOO=bar claude
+  claude-jail compose -- logs -f squid
+  claude-jail compose -- run --rm -e FOO=bar claude
   ```
 - `prune`: remove the per-package-set images (`claude-jail-<digest>`; see `packages` configuration).
-
-With a `user` key set in the config, the `--user` flag can be omitted.
 
 `-c` lets you launch from anywhere:
 
@@ -121,7 +119,8 @@ Example:
 ```
 
 Available keys:
-- `user`: the config namespace. The `--user` flag overrides it; one of the two must be set.
+- `user`: the config namespace. The `--user` flag overrides it; with neither
+  set, it defaults to the host's `$USER`/`$USERNAME` environment variable.
 - `roots`: the directories to jail, each bind-mounted (read-write by default) at
   `/workspace/<abs path>`. A list whose entries are either a string path or an
   object `{ "path", "read_only", "hidden" }`. A relative `path` is resolved

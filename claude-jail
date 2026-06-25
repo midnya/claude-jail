@@ -36,6 +36,7 @@ import build_mounts
 import build_packages
 import build_prompt
 import ide
+import resolve_ids
 import resolve_user
 from jail_config import (classify_config, config_dir, container_path, die,
                          parse_roots, read_config, resolved_config,
@@ -450,6 +451,7 @@ def build_jail(user_flag: "str | None", config_path: str,
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
+    ids = resolve_ids.resolve(data, config_path)
     roots = parse_roots(data, config_path)
     config_class = classify_config(roots, config_path)
     workdir = container_workdir(config_path)
@@ -479,12 +481,19 @@ def build_jail(user_flag: "str | None", config_path: str,
         "JAIL_DNS_ACL": dns_acl,
         "JAIL_DNS_IP": dns_ip,
         "JAIL_NET_SUBNET": dns_subnet,
+        # The container user's numeric identity, defaulting to the host's so the
+        # agent's writes through the bind mounts land owned by you. Baked into the
+        # image's user at build time, so — like the packages below — it folds into
+        # the content-addressed tag.
+        "JAIL_UID": str(ids.uid),
+        "JAIL_GID": str(ids.gid),
         # Extra apt/pip packages, baked into the image at build time. The suffix
-        # content-addresses the tag so a differing package set gets its own image
-        # rather than clobbering the shared one (built on first use).
+        # content-addresses the tag (over the packages and the uid/gid) so a
+        # differing build input gets its own image rather than clobbering the
+        # shared one (built on first use).
         "JAIL_APT_PACKAGES": " ".join(packages.apt),
         "JAIL_PIP_PACKAGES": " ".join(packages.pip),
-        "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages),
+        "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages, ids),
         **build_env.exports(data, config_path),
     }
     override, seeds = build_mounts.override(roots, config_class)

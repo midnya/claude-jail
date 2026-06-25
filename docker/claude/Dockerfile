@@ -40,7 +40,7 @@ RUN if getent group $USER_GID > /dev/null 2>&1; then \
     else \
         groupadd -g $USER_GID claude && GROUP_NAME=claude; \
     fi && \
-    useradd -m -s /bin/bash -u $USER_UID -g $GROUP_NAME claude
+    useradd -o -m -s /bin/bash -u $USER_UID -g $GROUP_NAME claude
 
 WORKDIR /app
 

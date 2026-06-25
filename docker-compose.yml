@@ -4,6 +4,8 @@ services:
     build:
       context: ./docker/claude
       args:
+        USER_UID: ${JAIL_UID}
+        USER_GID: ${JAIL_GID}
         EXTRA_APT_PACKAGES: ${JAIL_APT_PACKAGES:-}
         EXTRA_PIP_PACKAGES: ${JAIL_PIP_PACKAGES:-}
 
@@ -20,6 +22,7 @@ services:
     environment:
       CLAUDE_CODE_ENABLE_TELEMETRY: 0
       CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: 1
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1
       DISABLE_AUTOUPDATER: 1
 
       COLORTERM: truecolor

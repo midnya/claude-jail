@@ -2,6 +2,10 @@
 from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
 
 import build_packages as bp
+import resolve_ids as ri
+
+DEFAULT_IDS = ri.Ids(ri.DEFAULT_UID, ri.DEFAULT_GID)
+OTHER_IDS = ri.Ids(1500, 1600)
 
 
 def _apt(*names):
@@ -187,3 +191,48 @@ class ImageSuffixTests(JailTestCase):
         # namespacing the managers in the digest key keeps them apart.
         self.assertNotEqual(bp.image_suffix(bp.Packages(apt=["foo"], pip=[])),
                             bp.image_suffix(bp.Packages(apt=[], pip=["foo"])))
+
+
+class ImageSuffixIdsTests(JailTestCase):
+    """The container uid/gid is a build input, so it folds into the image tag."""
+
+    def test_default_ids_match_no_ids(self):
+        # None (the default user) and the explicit default ids are equivalent —
+        # neither folds in, so an existing package set keeps its old tag.
+        pkgs = bp.parse(_apt("jq"), "cfg")
+        self.assertEqual(bp.image_suffix(pkgs),
+                         bp.image_suffix(pkgs, DEFAULT_IDS))
+
+    def test_default_ids_empty_packages_has_no_suffix(self):
+        # The all-default baseline still maps to the bare `claude-jail` tag.
+        empty = bp.Packages(apt=[], pip=[])
+        self.assertEqual(bp.image_suffix(empty, DEFAULT_IDS), "")
+
+    def test_non_default_ids_suffix_even_without_packages(self):
+        # A pinned uid/gid alone needs its own image (the base tag is built with
+        # the Dockerfile's default user).
+        suffix = bp.image_suffix(bp.Packages(apt=[], pip=[]), OTHER_IDS)
+        self.assertRegex(suffix, r"\A-[0-9a-f]{8}\Z")
+
+    def test_non_default_ids_change_suffix(self):
+        pkgs = bp.parse(_apt("jq"), "cfg")
+        self.assertNotEqual(bp.image_suffix(pkgs, DEFAULT_IDS),
+                            bp.image_suffix(pkgs, OTHER_IDS))
+
+    def test_uid_and_gid_independent(self):
+        # Swapping uid for gid is a different image.
+        self.assertNotEqual(bp.image_suffix(bp.Packages(apt=[], pip=[]),
+                                            ri.Ids(1500, 1600)),
+                            bp.image_suffix(bp.Packages(apt=[], pip=[]),
+                                            ri.Ids(1600, 1500)))
+
+    def test_ids_section_cannot_collide_with_a_package(self):
+        # The labeled sections keep a package token from masquerading as the
+        # uid/gid fold: a package set spelling out the fold's own labels and
+        # values ("uid", "gid", "1500", "1600" — all valid tokens) under the
+        # default ids (so only the packages fold in) must still digest
+        # differently than the real OTHER_IDS fold over an empty set.
+        spoof = bp.Packages(apt=["uid", "gid"], pip=["1500", "1600"])
+        self.assertNotEqual(bp.image_suffix(spoof, DEFAULT_IDS),
+                            bp.image_suffix(bp.Packages(apt=[], pip=[]),
+                                            OTHER_IDS))

@@ -13,12 +13,14 @@ JAIL_APT_PACKAGES and JAIL_PIP_PACKAGES (the install args) and JAIL_IMAGE_SUFFIX
 them as build args and the image name. die() (from jail_config) reports a
 malformed config.
 
-The image tag is content-addressed on both package sets (claude-jail-<digest>,
-or plain claude-jail when empty) so two projects with different lists never
-share — and so never clobber — one image, the same way egress folds into the
-proxy's identity. A new or changed list is a new tag that compose builds on first
-use; the previous tag is left behind as an orphan (the launcher's `prune` command
-reclaims them), the same accepted cost as the egress-keyed volumes.
+The image tag is content-addressed on the build inputs (claude-jail-<digest>, or
+plain claude-jail for the baseline) so two projects whose images would differ
+never share — and so never clobber — one image, the same way egress folds into
+the proxy's identity. The inputs are the package sets and the container user's
+uid/gid (resolve_ids.py), both baked in at build time; image_suffix() takes both.
+A new or changed input is a new tag that compose builds on first use; the previous
+tag is left behind as an orphan (the launcher's `prune` command reclaims them),
+the same accepted cost as the egress-keyed volumes.
 
 Matching a package name is the security boundary: an entry can only ever become a
 bare token on the install line (or one line of a generated pip requirements
@@ -127,19 +129,29 @@ def parse(data: "dict", config_file: str) -> "Packages":
                        for key in _MANAGERS})
 
 
-def image_suffix(packages: "Packages") -> str:
-    """The image-tag suffix for the package sets: '' when empty, else '-<8 hex>'.
+def image_suffix(packages: "Packages", ids: "Ids | None" = None) -> str:
+    """The image-tag suffix for the build inputs: '' for the baseline, else '-<8 hex>'.
 
     Content-addressed so the tag (and thus the built image) changes only when a
-    package set does, never with order or duplicates — parse() already
-    canonicalises the lists. The digest key is built from the namedtuple's own
-    fields, each manager prefixed by its name, so a new manager folds in
-    automatically and an entry can never collide across managers. Shares the
-    launcher's short_digest, so the egress id and this tag can't drift to
-    different digest shapes.
+    build input does, never with order or duplicates — parse() already
+    canonicalises the package lists. The two inputs are the extra packages and
+    the container user's numeric identity (resolve_ids.Ids), both baked into the
+    image at build time; `ids` is None for the default user (no fold), so an
+    all-default config — no packages, default uid/gid — maps to the bare
+    `claude-jail` base tag. A non-default uid/gid appends its own labeled section
+    (Ids.digest_key), keeping a differing user on its own image; the default-user
+    digest is left untouched so an existing package set keeps its tag. The
+    package key is built from the namedtuple's own fields, each manager prefixed
+    by its name, so a new manager folds in automatically and an entry can never
+    collide across managers or with the uid/gid section. Shares the launcher's
+    short_digest, so the egress id and this tag can't drift to different digest
+    shapes.
     """
-    if not any(packages):
+    ids_default = ids is None or ids.is_default()
+    if not any(packages) and ids_default:
         return ""
     key = "\n".join(f"{manager}\n" + "\n".join(getattr(packages, manager))
                     for manager in packages._fields)
+    if not ids_default:
+        key += "\n" + ids.digest_key()
     return "-" + short_digest(key)

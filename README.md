@@ -93,7 +93,8 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
   claude-jail compose -- logs -f squid
   claude-jail compose -- run --rm -e FOO=bar claude
   ```
-- `prune`: remove the per-package-set images (`claude-jail-<digest>`; see `packages` configuration).
+- `prune`: remove the content-addressed images (`claude-jail-<digest>`) left
+  behind when a `packages` list or a `uid`/`gid` changes.
 
 `-c` lets you launch from anywhere:
 
@@ -130,6 +131,11 @@ Example:
 Available keys:
 - `user`: the config namespace. The `--user` flag overrides it; with neither
   set, it defaults to the host's `$USER`/`$USERNAME` environment variable.
+- `uid` / `gid`: the numeric ids the in-container user is built with. They
+  default to the host user's own (`id -u` / `id -g`), so files the agent writes
+  through the mounts land owned by you. Like `packages`, they fold into the image
+  tag, so changing either mints a fresh image (rebuilt on first use); clean the
+  old one with `claude-jail prune`.
 - `roots`: the directories to jail, each bind-mounted (read-write by default) at
   `/workspace/<abs path>`. A list whose entries are either a string path or an
   object `{ "path", "read_only", "hidden" }`. A relative `path` is resolved

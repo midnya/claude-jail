@@ -71,8 +71,9 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
   use `--` to pass a leading-dash argument:
 
   ```sh
-  claude-jail                                 # start a session
-  claude-jail -- --help                       # -> claude --help
+  claude-jail                                 # Resume the last session
+  claude-jail run                             # Start a new one
+  claude-jail -- --help                       # -> `claude --help`
   claude-jail run -- -p "summarize this repo"
   ```
 

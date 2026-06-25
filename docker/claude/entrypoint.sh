@@ -7,6 +7,13 @@ if [ -n "${CLAUDE_APPEND_SYSTEM_PROMPT:-}" ]; then
     args+=(--append-system-prompt "$CLAUDE_APPEND_SYSTEM_PROMPT")
 fi
 
+if [ "$#" -eq 0 ]; then
+    project_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(pwd | sed 's/[^a-zA-Z0-9]/-/g')"
+    if compgen -G "$project_dir/*.jsonl" > /dev/null; then
+        args+=(--continue)
+    fi
+fi
+
 # Apply the jail's default permission mode only when the caller didn't pass a
 # --permission-mode of their own. Injecting it unconditionally would put two
 # --permission-mode flags on the command line, leaving "command line wins" at

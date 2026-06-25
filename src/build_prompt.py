@@ -29,6 +29,7 @@ cannot be placed in the environment).
 """
 from pathlib import Path
 
+from build_packages import Packages, empty
 from jail_config import (Root, config_dir, confine_to_roots, container_path,
                          die, trusted_host_path)
 
@@ -143,38 +144,56 @@ def roots_segment(roots: "list[Root]", workdir: str) -> str:
     return "\n".join(lines)
 
 
-def packages_segment(packages: "list[str]") -> str:
-    """A prompt segment naming the extra packages installed in this jail, or "".
+def packages_segment(packages: "Packages") -> str:
+    """A prompt segment reporting the extra packages baked into this jail.
 
-    The project's `packages.apt` are baked into the image, so telling the agent
-    they are available saves it rediscovering (or wrongly assuming the absence
-    of) them. Empty when none were requested, so merge() drops the section.
+    The project's `packages.apt`/`packages.pip` are installed into the image, so
+    telling the agent what is there saves it rediscovering (or wrongly assuming
+    the absence of) them. The pip line is always emitted — the venv always exists
+    and the base prompt promises this section reports it either way, so the agent
+    knows whether anything extra is installed in it — while the apt line names
+    only the project's extra requests and appears only when there are some.
+
+    The venv lives at a root-owned path, so the agent (running unprivileged)
+    cannot modify it in place, and `--user` installs are disabled image-wide
+    (PYTHONNOUSERSITE=1) so a stray one isn't importable either. None of this is
+    a security boundary — the agent can run anything; the real barrier is
+    default-deny egress. The line just points at the ask-before-installing rule
+    rather than enumerating these.
     """
-    if not packages:
-        return ""
-    listed = ", ".join(f"`{p}`" for p in packages)
-    return "\n".join([
-        "# Installed packages",
-        "",
-        "These extra system packages have been installed in this sandbox at "
-        f"the project's request and are available to use: {listed}.",
-    ])
+    venv_note = ("`python3`, `pip`, and any installed console scripts resolve to "
+                 "a venv on your `PATH`; the venv itself is read-only (root-owned), "
+                 "so you can't change it in place — install anything new only "
+                 "after asking, per the package rule above.")
+    lines = ["# Installed packages", "",
+             "Extra packages for this sandbox, requested by the project:"]
+    if packages.apt:
+        listed = ", ".join(f"`{p}`" for p in packages.apt)
+        lines.append(f"- System packages (apt): {listed}.")
+    pip_body = (", ".join(f"`{p}`" for p in packages.pip) if packages.pip
+                else "none requested")
+    pip_line = f"- Python packages (pip): {pip_body} — {venv_note}"
+    if not packages.pip:
+        pip_line += " Nothing extra is installed in the venv."
+    lines.append(pip_line)
+    return "\n".join(lines)
 
 
 def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
           config_in_jail: bool, workdir: str,
-          packages: "list[str] | None" = None) -> str:
+          packages: "Packages | None" = None) -> str:
     """Merge the base jail prompt, the runtime sections, and the project prompt.
 
     In order: the base jail prompt, the generated project-roots section, the
-    generated installed-packages section (when `packages` is non-empty), then
-    the project's own system_prompts, separated by blank lines. With no project
-    prompt the generated sections still pass through. `workdir` is the container
-    working directory the agent starts in.
+    generated installed-packages section (always present — it reports the pip
+    venv's contents, or their absence), then the project's own system_prompts,
+    separated by blank lines. With no project prompt the generated sections still
+    pass through. `workdir` is the container working directory the agent starts
+    in.
     """
     extra = user_prompt(data, config_file, config_dir(config_file), roots,
                         config_in_jail)
     sections = (base, roots_segment(roots, workdir),
-                packages_segment(packages or []), extra)
+                packages_segment(packages or empty()), extra)
     parts = [p.strip("\n") for p in sections if p and p.strip()]
     return "\n\n".join(parts)

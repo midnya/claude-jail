@@ -5,6 +5,7 @@ services:
       context: ./docker/claude
       args:
         EXTRA_APT_PACKAGES: ${JAIL_APT_PACKAGES:-}
+        EXTRA_PIP_PACKAGES: ${JAIL_PIP_PACKAGES:-}
 
     networks:
       - jail-internal

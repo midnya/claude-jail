@@ -16,6 +16,9 @@ Its .git has always been quarantined.
 
 ## Security model (so far)
 
+Because most of Claude Code features rely on arbitrary code execution, we try to reduce
+the attack surface as much as possible, while still offering convenience for day-to-day
+operations:
 - Filesystem protection: bypasses Claude's sandbox feature and relies on Docker's instead.
   - For convenience, `/tmp` is a persisted volume that is shared per-workspace,
     between jail instances.
@@ -29,6 +32,9 @@ Its .git has always been quarantined.
     resolver. It enforces the same deny/allow list as Squid's. Every lookup is logged
     to a per-jail volume. For convenience, CNAMEs are followed even if not
     explicitely allowed.
+- Additional packages are declared, and pre-baked in the image via a configuration file.
+  - Read-only for packages stores is implemented, but should not be relied upon.
+    Claude is able to run anything, so this won't stop, just fires errors and delay.
 - Opt-in exception: `--ide` opens a channel from the sandbox to a running code
   editor on the host.
   - It watches the host's `~/.claude/ide` lockfile directory, therefore republishing
@@ -105,7 +111,10 @@ Example:
   "default_mode": "plan",
   "system_prompts": { "path": "CLAUDE_JAIL_PROMPT.md" },
   "egress": { "default": "deny", "allowed": ["github.com", "pypi.org", "10.0.0.0/8"] },
-  "packages": { "apt": ["jq", "ripgrep"] },
+  "packages": {
+    "apt": ["jq", "ripgrep"],
+    "pip": ["requests==2.31.0", "ruff"]
+  },
   "roots": [
     {
       "path": ".",
@@ -152,9 +161,22 @@ Available keys:
       range. A bare IP without a prefix is rejected — write `/32` (`/128` for IPv6).
   - `*.anthropic.com` and `*.claude.com` are always reachable, so the jail can always reach the API.
 - `packages`: extra packages to install into this jail's image, grouped by
-  manager. Only `apt` is currently supported. Note that the package set is folded into the
-  image tag, so changing the list builds a fresh image and leaves the previous
-  one behind. Clean with `claude-jail prune`.
+  manager (installed at build time, since a running jail has no egress to the
+  package mirrors).
+  - `apt`: Debian package names, added on top of the image's fixed set.
+  - `pip`: Python distributions. An entry is a PyPI name with optional extras
+    and version specifiers — pins, ranges, and wildcards (`requests==2.31.0`,
+    `django<5`, `numpy==1.26.*`, `uvicorn[standard]`). It is a permissive
+    filter, not a full PEP 508 validator: URL/VCS installs and environment
+    markers (`pkg; python_version<"3"`) are rejected outright, and anything
+    else malformed is caught by `uv` at build time.
+    - They are installed with [`uv`](https://github.com/astral-sh/uv)
+      into a `--system-site-packages` venv; root-owned (so read-only to the
+      unprivileged agent in the container), prepended to `PATH`.
+    - The venv is read-only and `--user` installs are disabled.
+  - Note that the package sets are folded into the image tag, so changing a list
+    builds a fresh image and leaves the previous one behind. Clean with
+    `claude-jail prune`.
 - `system_prompts`: an extra system prompt, appended to the jail's built-in one.
   A segment is either inline text or a file path, and you may pass one or a list of them:
   - inline: `"system_prompts": "Prefer pnpm over npm in this repo."`

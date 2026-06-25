@@ -4,6 +4,7 @@ import os
 from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
 
 import build_prompt as bp
+from build_packages import Packages
 from jail_config import Root
 
 
@@ -122,14 +123,47 @@ class RootsSegmentTests(JailTestCase):
 
 
 class PackagesSegmentTests(JailTestCase):
-    def test_empty_when_no_packages(self):
-        self.assertEqual(bp.packages_segment([]), "")
+    def test_reports_pip_none_when_empty(self):
+        # The section always renders; the pip line reports the absence (the venv
+        # exists but is empty) and no apt line appears.
+        out = bp.packages_segment(Packages(apt=[], pip=[]))
+        self.assertIn("# Installed packages", out)
+        self.assertIn("none requested", out)
+        # Accurate read-only wording: tell the agent to ask, not that every
+        # install "fails" — `pip install --user` succeeds, so guard that false
+        # claim from creeping back in.
+        self.assertIn("read-only", out)
+        self.assertIn("after asking", out)
+        self.assertNotIn("fails", out)
+        self.assertNotIn("System packages", out)
 
-    def test_lists_packages(self):
-        out = bp.packages_segment(["jq", "ripgrep"])
+    def test_lists_apt_packages(self):
+        out = bp.packages_segment(Packages(apt=["jq", "ripgrep"], pip=[]))
         self.assertIn("# Installed packages", out)
         self.assertIn("`jq`", out)
         self.assertIn("`ripgrep`", out)
+        # apt present but pip empty still reports pip's absence.
+        self.assertIn("none requested", out)
+
+    def test_lists_pip_packages(self):
+        out = bp.packages_segment(Packages(apt=[], pip=["ruff"]))
+        self.assertIn("# Installed packages", out)
+        self.assertIn("`ruff`", out)
+        # The pip line tells the agent the packages live in a venv on PATH, and
+        # is accurate about the read-only venv (no false "install fails" claim).
+        self.assertIn("venv", out)
+        self.assertIn("read-only", out)
+        self.assertNotIn("fails", out)
+        self.assertNotIn("System packages", out)
+
+    def test_lists_both(self):
+        out = bp.packages_segment(Packages(apt=["jq"], pip=["ruff"]))
+        self.assertIn("# Installed packages", out)
+        # Both lines render under their own label, and the pip line still carries
+        # the venv note (the "always emitted" invariant) even when apt is present.
+        self.assertIn("- System packages (apt): `jq`.", out)
+        self.assertIn("- Python packages (pip): `ruff` —", out)
+        self.assertIn("venv", out)
 
 
 class MergeTests(JailTestCase):
@@ -153,14 +187,18 @@ class MergeTests(JailTestCase):
     def test_packages_section_between_roots_and_extra(self):
         root = self.tmpdir()
         out = bp.merge("BASE", {"system_prompts": "EXTRA"}, "cfg.json",
-                       self.roots(root), True, "/workspace" + root, ["jq"])
+                       self.roots(root), True, "/workspace" + root,
+                       Packages(apt=["jq"], pip=[]))
         self.assertLess(out.index("# Project roots"),
                         out.index("# Installed packages"))
         self.assertLess(out.index("# Installed packages"), out.index("EXTRA"))
         self.assertIn("`jq`", out)
 
-    def test_no_packages_section_when_empty(self):
+    def test_packages_section_present_when_empty(self):
+        # The section always renders, even with nothing installed: it reports the
+        # pip venv's absence so the base prompt's pointer to it is never broken.
         root = self.tmpdir()
         out = bp.merge("BASE", {}, "cfg.json", self.roots(root), True,
-                       "/workspace" + root, [])
-        self.assertNotIn("# Installed packages", out)
+                       "/workspace" + root, Packages(apt=[], pip=[]))
+        self.assertIn("# Installed packages", out)
+        self.assertIn("none requested", out)

@@ -479,10 +479,11 @@ def build_jail(user_flag: "str | None", config_path: str,
         "JAIL_DNS_ACL": dns_acl,
         "JAIL_DNS_IP": dns_ip,
         "JAIL_NET_SUBNET": dns_subnet,
-        # Extra apt packages, baked into the image at build time. The suffix
+        # Extra apt/pip packages, baked into the image at build time. The suffix
         # content-addresses the tag so a differing package set gets its own image
         # rather than clobbering the shared one (built on first use).
-        "JAIL_APT_PACKAGES": build_packages.build_arg(packages),
+        "JAIL_APT_PACKAGES": " ".join(packages.apt),
+        "JAIL_PIP_PACKAGES": " ".join(packages.pip),
         "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages),
         **build_env.exports(data, config_path),
     }

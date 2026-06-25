@@ -63,6 +63,23 @@ RUN if [ -n "$EXTRA_APT_PACKAGES" ]; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
+# uv 0.11.24-python3.13-trixie-slim
+COPY --from=ghcr.io/astral-sh/uv@sha256:dbabc35ae87836369ca9a2052a4f0bd3c76135b1cf32c33d8ec149927135019d /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+
+ENV PATH="/opt/jail-venv/bin:$PATH"
+
+ENV PYTHONNOUSERSITE=1
+RUN uv venv --seed --system-site-packages --python /usr/bin/python3 /opt/jail-venv
+RUN printf 'export PATH="/opt/jail-venv/bin:$PATH"\n' > /etc/profile.d/jail-venv.sh
+
+ARG EXTRA_PIP_PACKAGES=""
+RUN if [ -n "$EXTRA_PIP_PACKAGES" ]; then \
+        set -f; \
+        printf '%s\n' $EXTRA_PIP_PACKAGES > /tmp/requirements.txt && \
+        uv pip install --python /opt/jail-venv/bin/python --no-cache -r /tmp/requirements.txt && \
+        rm /tmp/requirements.txt; \
+    fi
+
 COPY entrypoint.sh /usr/local/bin/claude-jail-entrypoint
 RUN chmod +x /usr/local/bin/claude-jail-entrypoint
 

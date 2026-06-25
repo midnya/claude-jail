@@ -12,6 +12,11 @@ don't try to work around them:
   install it silently. Stop and ask the user a clear question — name the package
   and why it's needed — so they can accept and run the installation for you, or
   refuse. Wait for their decision before proceeding.
+- **Python runs from a read-only venv.** `python3`, `pip`, and installed console
+  scripts resolve to a root-owned virtualenv on your `PATH`, so installing Python
+  packages follows the ask-first rule above. The **Installed packages** section
+  further down names exactly what's in the venv (or says it's empty) — rely on it
+  rather than guessing or assuming.
 - **No git write operations.** Do not run git commands that change history or
   refs — no `commit`, `push`, `pull`, `merge`, `rebase`, `reset`, branch
   `checkout`/`switch`, `tag`, `stash`, etc. The `.git` directory is mounted

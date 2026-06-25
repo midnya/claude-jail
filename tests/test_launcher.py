@@ -89,6 +89,15 @@ class ParseArgsTests(JailTestCase):
     def test_subnet_defaults_to_none(self):
         self.assertIsNone(L.parse_args(["-u", "me"]).subnet)
 
+    def test_claude_dir_base_flag(self):
+        args = L.parse_args(["--claude-dir-base", "/data/jh", "run", "-p", "hi"])
+        self.assertEqual(args.claude_dir_base, "/data/jh")
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["-p", "hi"])
+
+    def test_claude_dir_base_defaults_to_none(self):
+        self.assertIsNone(L.parse_args(["-u", "me"]).claude_dir_base)
+
     def test_empty_user_rejected(self):
         # argparse prints usage to stderr then exits 2; swallow the noise.
         with contextlib.redirect_stderr(io.StringIO()), \
@@ -104,6 +113,11 @@ class ParseArgsTests(JailTestCase):
         with contextlib.redirect_stderr(io.StringIO()), \
                 self.assertRaises(SystemExit):
             L.parse_args(["--config", ""])
+
+    def test_empty_claude_dir_base_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            L.parse_args(["--claude-dir-base", ""])
 
 
 class ResolveCommandTests(JailTestCase):

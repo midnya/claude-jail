@@ -36,6 +36,7 @@ import build_mounts
 import build_packages
 import build_prompt
 import ide
+import resolve_claude_dir_base
 import resolve_ids
 import resolve_user
 from jail_config import (classify_config, config_dir, container_path, die,
@@ -74,12 +75,20 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
         "-u", "--user", metavar="NAME",
         help='config namespace, overriding the "user" key in the config file '
              "(one of the two must be set); config and credentials persist on "
-             "the host in ~/.claude-jail-<name>/ and ~/.claude-jail-<name>.json",
+             "the host under the claude-dir-base (default $HOME) as "
+             ".claude-jail-<name>/ and .claude-jail-<name>.json",
     )
     parser.add_argument(
         "-c", "--config", metavar="PATH",
         help="jail config file (default: ./.claude-jail.json); its roots "
              "(or its own directory) become the jail",
+    )
+    parser.add_argument(
+        "--claude-dir-base", metavar="DIR",
+        help="base directory for the per-user config/credential store, "
+             'overriding the "claude_dir_base" key (default: $HOME); the store '
+             "persists in <dir>/.claude-jail-<user>/ and "
+             "<dir>/.claude-jail-<user>.json",
     )
     parser.add_argument(
         "--subnet", metavar="CIDR",
@@ -106,6 +115,8 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
         parser.error("--user requires a non-empty value")
     if args.config == "":
         parser.error("--config requires a non-empty value")
+    if args.claude_dir_base == "":
+        parser.error("--claude-dir-base requires a non-empty value")
     if args.subnet == "":
         parser.error("--subnet requires a non-empty value")
     rest = args.rest
@@ -439,20 +450,29 @@ def container_workdir(config_path: str) -> str:
 
 
 def build_jail(user_flag: "str | None", config_path: str,
-               subnet: "str | None" = None) -> "tuple[dict, str, list[str]]":
+               subnet: "str | None" = None,
+               claude_dir_base_flag: "str | None" = None,
+               store_must_exist: bool = True
+               ) -> "tuple[dict, str, list[str]]":
     """Validate the config and assemble the launch environment and mount override.
 
     Resolves the jail roots from the config (or its own directory), confines the
     system prompt, and masks the active config in whichever root holds it. Runs
     entirely before any host state is touched, so a bad config aborts via die()
-    here. Returns (environment, override, seeds): the jail user and compose
-    project name live in environment (JAIL_USER / COMPOSE_PROJECT_NAME); seeds
-    lists absent config files the caller creates as `{}` before a container launch.
+    here. Returns (environment, override, seeds): the jail user, compose project
+    name and config store base live in environment (JAIL_USER /
+    COMPOSE_PROJECT_NAME / JAIL_CLAUDE_DIR_BASE); seeds lists absent config files
+    the caller creates as `{}` before a container launch.
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
     ids = resolve_ids.resolve(data, config_path)
-    roots = parse_roots(data, config_path)
+    # The base of the per-user store; no root may be it or contain it. Its
+    # existence is only required when the run launches a container (store_must_exist),
+    # so a down/logs/ps still works when a configured base has gone missing.
+    claude_dir_base = resolve_claude_dir_base.resolve(
+        data, claude_dir_base_flag, config_path, must_exist=store_must_exist)
+    roots = parse_roots(data, config_path, claude_dir_base)
     config_class = classify_config(roots, config_path)
     workdir = container_workdir(config_path)
     packages = build_packages.parse(data, config_path)
@@ -471,6 +491,10 @@ def build_jail(user_flag: "str | None", config_path: str,
     environment = {
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
+        # The host base for the per-user store; compose interpolates it into the
+        # ${JAIL_CLAUDE_DIR_BASE} bind sources. May be "" only when defaulting to
+        # an unset $HOME — main() turns that into a fatal error at launch.
+        "JAIL_CLAUDE_DIR_BASE": claude_dir_base,
         "JAIL_WORKDIR": workdir,
         "COMPOSE_PROJECT_NAME": compose_project,
         "JAIL_EGRESS_ID": egress_id,
@@ -527,8 +551,14 @@ def main() -> None:
         die(f"base system prompt not found: {PROMPT_FILE}")
 
     config_path = args.config or os.path.join(os.getcwd(), ".claude-jail.json")
+    # Resolve the command before the config: only a launch mounts the per-user
+    # store, so only a launch requires a configured claude_dir_base to already
+    # exist — a down/logs/ps must still work when it points at a now-missing dir.
+    compose_args, launches, teardown = resolve_command(args.command,
+                                                       args.command_args)
     environment, override, seeds = build_jail(args.user, config_path,
-                                              args.subnet)
+                                              args.subnet, args.claude_dir_base,
+                                              store_must_exist=launches)
     # The opt-in IDE bridge is wholly owned by the `ide` package: its env
     # additions point the in-jail CLI at the relay; everything else (the host
     # helper, the lockfile mirror dir) lives behind start()/stop() below.
@@ -550,21 +580,20 @@ def main() -> None:
         os.environ.pop("CLAUDE_CODE_IDE_HOST_OVERRIDE", None)
 
     base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
-    compose_args, launches, teardown = resolve_command(args.command,
-                                                       args.command_args)
     # Only a command that actually launches the jail container needs the host
     # state the mounts consume — and the mount override itself.
     ide_mirror = None
     if launches:
-        home_env = os.environ.get("HOME")
-        if not home_env:
-            die("HOME is not set; cannot locate the per-user config directory")
-        ensure_user_config(Path(home_env), environment["JAIL_USER"])
+        base = environment["JAIL_CLAUDE_DIR_BASE"]
+        if not base:
+            die("no config store location: $HOME is not set; add a "
+                '"claude_dir_base" key to the config or pass --claude-dir-base')
+        ensure_user_config(Path(base), environment["JAIL_USER"])
         if override:
             build_mounts.ensure_empty_mask()
         build_mounts.seed_masked_configs(seeds)
         if args.ide:
-            ide_mirror = ide.prepare(Path(home_env), environment["JAIL_USER"])
+            ide_mirror = ide.prepare(Path(base), environment["JAIL_USER"])
             # Skip the bring-up when the bridge can't reach the editor (non-Linux
             # host, or no gateway): prepare() has already warned, and `up -d` would
             # otherwise leave a dead ide-host behind while reporting success.

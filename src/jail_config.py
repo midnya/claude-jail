@@ -38,7 +38,7 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # key — at the top level turns a silently-ignored legacy config or a typo into a
 # hard error, instead of a jail that quietly drops the protections they meant.
 TOP_LEVEL_KEYS = {"user", "uid", "gid", "default_mode", "system_prompts",
-                  "roots", "egress", "packages"}
+                  "roots", "egress", "packages", "claude_dir_base"}
 
 
 def die(msg: str) -> "None":
@@ -170,23 +170,26 @@ def _inside(root: Path, target: Path) -> bool:
     return target == root or root in target.parents
 
 
-def _forbidden_root(root_dir: str) -> bool:
-    """True for a root too broad to jail: the filesystem root, or $HOME or any
-    ancestor of it.
+def _forbidden_root(root_dir: str, base: "str | None" = None) -> bool:
+    """True for a root too broad to jail: the filesystem root, or the config
+    store base (claude_dir_base, default $HOME) or any ancestor of it.
 
-    The filesystem root bind-mounts the whole host. $HOME — or any directory
-    that contains it (e.g. /home) — bind-mounts the per-user credential store
-    (~/.claude-jail-*) read-write into the sandbox, letting the agent steal or
-    rewrite its own login, so reject the home directory and every ancestor, not
-    just an exact match.
+    The filesystem root bind-mounts the whole host. The store base — or any
+    directory that contains it — bind-mounts the per-user credential store
+    (<base>/.claude-jail-*) read-write into the sandbox, letting the agent steal
+    or rewrite its own login, so reject the base and every ancestor, not just an
+    exact match. The same relation (`_inside(root, base)`) also rejects the
+    inverse case — a `base` that resolves *inside* a root — so the store can
+    never end up agent-writable from either direction. A falsy `base` falls back
+    to $HOME, the default store location and the historical behavior.
     """
     if root_dir == os.sep:
         return True
-    home = os.environ.get("HOME")
-    if not home:
+    base = base or os.environ.get("HOME")
+    if not base:
         return False
-    # _inside(root, home) is True when root *is* HOME or an ancestor of it.
-    return _inside(Path(root_dir), Path(os.path.realpath(home)))
+    # _inside(root, base) is True when root *is* the base or an ancestor of it.
+    return _inside(Path(root_dir), Path(os.path.realpath(base)))
 
 
 def _key_list(entry: "dict", key: str, config_file: str) -> "list":
@@ -197,7 +200,8 @@ def _key_list(entry: "dict", key: str, config_file: str) -> "list":
     return value
 
 
-def parse_roots(data: "dict", config_file: str) -> "list[Root]":
+def parse_roots(data: "dict", config_file: str,
+                store_base: "str | None" = None) -> "list[Root]":
     """Resolve the jail roots from the config.
 
     `roots` is a list whose entries are either a bare string (shorthand for
@@ -206,7 +210,11 @@ def parse_roots(data: "dict", config_file: str) -> "list[Root]":
     file; an absolute one is taken as-is; both are realpath'd. When `roots` is
     absent the single root is the config file's own directory. Each root must be
     an existing directory, and roots may not be nested in or duplicate one
-    another (overlapping bind mounts). Calls die() on any violation.
+    another (overlapping bind mounts). `store_base` is the resolved config store
+    directory (claude_dir_base, default $HOME); no root may be it or a directory
+    containing it (either would bind the credential store into the jail — a root
+    *inside* the base, e.g. a project under $HOME, is fine). Calls die() on any
+    violation.
     """
     base = config_dir(config_file)
     entries = data.get("roots")
@@ -237,9 +245,10 @@ def parse_roots(data: "dict", config_file: str) -> "list[Root]":
         root_dir = os.path.realpath(p)
         if not os.path.isdir(root_dir):
             die(f"root path is not a directory: {path}")
-        if _forbidden_root(root_dir):
-            die(f"a jail root may not be the filesystem root, your home "
-                f"directory, or a directory containing it: {path}")
+        if _forbidden_root(root_dir, store_base):
+            die(f"a jail root may not be the filesystem root, the config store "
+                f"directory (claude_dir_base, default $HOME), or a directory "
+                f"containing it: {path}")
         for other in roots:
             if (root_dir == other.dir
                     or _inside(Path(root_dir), Path(other.dir))

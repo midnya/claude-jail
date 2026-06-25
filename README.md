@@ -49,14 +49,18 @@ operations:
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [--subnet <cidr>] [--ide] [COMMAND] [args...]
+claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--ide] [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
-  persist on the host in `~/.claude-jail-<name>/` and `~/.claude-jail-<name>.json`,
-  created on first run. Use different names to keep separate identities/logins.
+  persist on the host in `<claude-dir-base>/.claude-jail-<name>/` and
+  `<claude-dir-base>/.claude-jail-<name>.json` (`<claude-dir-base>` defaults to
+  `$HOME`), created on first run. Use different names to keep separate
+  identities/logins.
 - `--config <path>` (`-c`): the jail config file. Defaults to
   `./.claude-jail.json`.
+- `--claude-dir-base <dir>`: the host base directory for the per-user store above.
+  Overrides the `claude_dir_base` config key; defaults to `$HOME`.
 - `--subnet <cidr>`: override the jail's internal Docker subnet (e.g.
   `10.123.45.0/24`). Must be a private (RFC1918) range, `/26` or larger.
 - `--ide`: bridge the in-jail `/ide` to a code editor running on the host.
@@ -137,6 +141,14 @@ Available keys:
   through the mounts land owned by you. Like `packages`, they fold into the image
   tag, so changing either mints a fresh image (rebuilt on first use); clean the
   old one with `claude-jail prune`.
+- `claude_dir_base`: the host base directory for the per-user store
+  (`<claude_dir_base>/.claude-jail-<user>/` and
+  `<claude_dir_base>/.claude-jail-<user>.json`).
+  The `--claude-dir-base` flag overrides it; with neither set, it defaults to `$HOME`.
+  A relative value is resolved against the config file's directory, `~` is
+  expanded, and the directory must already exist when launching the jail. No jail
+  root may be it or a directory containing it (either would expose the credential
+  store); a root *inside* it, such as a project under `$HOME`, is fine.
 - `roots`: the directories to jail, each bind-mounted (read-write by default) at
   `/workspace/<abs path>`. A list whose entries are either a string path or an
   object `{ "path", "read_only", "hidden" }`. A relative `path` is resolved
@@ -198,8 +210,9 @@ Notes:
   every subdomain; a CIDR is matched by range. A prefix must be provided.
 - `.git` in every root is always read-only.
 - Each root must be an existing directory; roots may not be nested in or
-  duplicate one another, nor be the filesystem root `/`, your home directory,
-  or a directory containing it.
+  duplicate one another, nor be the filesystem root `/`, the config store
+  directory (`claude_dir_base`, default `$HOME`), or a directory containing it —
+  that store holds your credentials, so a root must never expose it.
 - `.claude-jail.json` in every root is hidden inside the container,
   including the active config wherever it sits, even if it doesn't exist yet.
 - A config path that names something inside a root but escapes via a symlink is

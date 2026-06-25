@@ -42,12 +42,12 @@ services:
       no_proxy: localhost,127.0.0.1,::1${JAIL_IDE_NO_PROXY:-}
     volumes:
       - type: bind
-        source: ${HOME}/.claude-jail-${JAIL_USER}
+        source: ${JAIL_CLAUDE_DIR_BASE}/.claude-jail-${JAIL_USER}
         target: /home/claude/.claude
         bind:
           create_host_path: false
       - type: bind
-        source: ${HOME}/.claude-jail-${JAIL_USER}.json
+        source: ${JAIL_CLAUDE_DIR_BASE}/.claude-jail-${JAIL_USER}.json
         target: /home/claude/.claude.json
         bind:
           create_host_path: false
@@ -121,13 +121,13 @@ services:
       JAIL_NET_SUBNET: ${JAIL_NET_SUBNET:-}
     volumes:
       - type: bind
-        source: ${HOME}/.claude/ide
+        source: ${JAIL_CLAUDE_DIR_BASE}/.claude/ide
         target: /host-ide
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${HOME}/.claude-jail-${JAIL_USER}/ide
+        source: ${JAIL_CLAUDE_DIR_BASE}/.claude-jail-${JAIL_USER}/ide
         target: /jail-ide
         bind:
           create_host_path: false
@@ -141,7 +141,7 @@ services:
       JAIL_IDE_GATEWAY: ${JAIL_IDE_GATEWAY:-}
     volumes:
       - type: bind
-        source: ${HOME}/.claude/ide
+        source: ${JAIL_CLAUDE_DIR_BASE}/.claude/ide
         target: /host-ide
         read_only: true
         bind:

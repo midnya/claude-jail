@@ -88,6 +88,29 @@ class ForbiddenRootTests(JailTestCase):
             self.assertFalse(jc._forbidden_root(other))
             self.assertTrue(jc._forbidden_root(os.sep))
 
+    def test_explicit_base_forbids_base_and_ancestors(self):
+        base = self.tmpdir()
+        # No HOME, so only the passed base (and its ancestors) is forbidden.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(jc._forbidden_root(base, base))            # base itself
+            self.assertTrue(jc._forbidden_root(str(Path(base).parent), base))
+
+    def test_explicit_base_forbids_a_root_containing_the_store(self):
+        # base sits inside a candidate root: the root would expose the store, so
+        # the same _inside relation rejects it from this direction too.
+        root = self.tmpdir()
+        base = self.mkdir(os.path.join(root, "store"))
+        self.assertTrue(jc._forbidden_root(root, base))
+
+    def test_explicit_base_overrides_home(self):
+        # With an explicit base, $HOME is no longer the anchor: a root equal to
+        # $HOME is allowed, while the base is forbidden.
+        home = self.tmpdir()
+        base = self.tmpdir()
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            self.assertFalse(jc._forbidden_root(home, base))
+            self.assertTrue(jc._forbidden_root(base, base))
+
 
 class ParseRootsTests(JailTestCase):
     def _config_in(self, d, data="{}"):
@@ -186,6 +209,15 @@ class ParseRootsTests(JailTestCase):
         with mock.patch.dict(os.environ, {"HOME": home}):
             with self.assertDies("a jail root may not be"):
                 jc.parse_roots(jc.read_config(cfg), cfg)
+
+    def test_root_containing_config_store_base_rejected(self):
+        # A root that is (or contains) the resolved store base is rejected,
+        # independent of $HOME, since it would mount the credential store rw.
+        d = self.tmpdir()
+        base = self.mkdir(os.path.join(d, "store"))
+        cfg = self._config_in(d, json.dumps({"roots": [d]}))
+        with self.assertDies("config store directory"):
+            jc.parse_roots(jc.read_config(cfg), cfg, base)
 
     def test_duplicate_roots_rejected(self):
         d = self.tmpdir()

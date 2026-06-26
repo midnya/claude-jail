@@ -4,7 +4,7 @@
     claude-jail [--user NAME] [--config PATH] [COMMAND] [args...]
 
 Leading --user/--config are ours. The rest is a strict command — run (the
-default), build, down, logs, ps — that the launcher turns into a fixed
+default), new, build, down, logs, ps — that the launcher turns into a fixed
 `docker compose` invocation itself, plus `prune`, a docker-image cleanup that
 sidesteps compose; arbitrary compose args are never forwarded except through
 the explicit `compose -- <args>` escape hatch. The jail is
@@ -49,7 +49,8 @@ PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 # The strict command surface. Anything not naming one of these defaults to `run`
 # with the whole remainder treated as arguments for claude; `compose` is the
 # explicit escape hatch that forwards its args to docker compose verbatim.
-KNOWN_COMMANDS = ("run", "build", "down", "logs", "ps", "prune", "compose")
+KNOWN_COMMANDS = ("run", "new", "build", "down", "logs", "ps", "prune",
+                  "compose")
 
 
 def parse_args(argv: "list[str]") -> argparse.Namespace:
@@ -60,7 +61,7 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
     arguments into a REMAINDER. We then dispatch that list ourselves: the first
     token, when it names one of KNOWN_COMMANDS, is the command; otherwise the
     command defaults to `run` and the whole remainder becomes arguments for
-    claude. For run and compose — which forward their args to an external
+    claude. For run, new and compose — which forward their args to an external
     parser — a single leading -- is dropped, which is how a leading-dash
     argument reaches claude (`claude-jail -u me -- --help`): argparse rejects a
     bare leading-dash token, so -- is the way to pass one through. The other
@@ -105,10 +106,11 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
     )
     parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
-        help="run (default) | build | down | logs | ps | prune | "
+        help="run (default) | new | build | down | logs | ps | prune | "
              "compose -- <args>; "
-             "args after the command are forwarded (to claude for run, "
-             "verbatim to docker compose for compose)",
+             "args after the command are forwarded (to claude for run and new, "
+             "verbatim to docker compose for compose). new starts a fresh "
+             "session instead of continuing the last one",
     )
     args = parser.parse_args(argv)
     if args.user == "":
@@ -125,9 +127,9 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
     else:
         args.command, cargs = "run", rest
     # The -- passthrough separator is meaningful only for the commands that hand
-    # their args to an external parser (claude via run, docker via compose);
+    # their args to an external parser (claude via run/new, docker via compose);
     # strip one leading occurrence there. Elsewhere a -- is a real argument.
-    if args.command in ("run", "compose") and cargs and cargs[0] == "--":
+    if args.command in ("run", "new", "compose") and cargs and cargs[0] == "--":
         cargs = cargs[1:]
     args.command_args = cargs
     return args
@@ -301,17 +303,22 @@ def resolve_command(command: str,
 
     Returns (compose_args, launches, teardown): `launches` is True when the
     command starts the jail container, so the caller prepares host state and
-    feeds the mount override; `teardown` is True only for a `run` (the strict
-    command, or the escape hatch invoking a run subcommand), so the caller
-    reference-counts and tears the side containers down afterwards. The escape
-    hatch's subcommand is parsed once, here, to decide both.
+    feeds the mount override; `teardown` is True only for a one-shot session —
+    the strict `run` and `new` commands, or the escape hatch invoking a `run`
+    subcommand — so the caller reference-counts and tears the side containers
+    down afterwards. The escape hatch's subcommand is parsed once, here, to
+    decide both.
 
     For `run`, the launch line is always `run --rm claude <args>`, so every
     user-supplied token lands after the service name: it can only reach claude
     (the entrypoint execs `claude "$@"`), never docker — that is what makes the
     strict commands strict. The `compose` escape hatch deliberately forgoes this.
+
+    `new` shares the `run` launch line verbatim; the two differ only in the
+    CLAUDE_JAIL_NEW_SESSION env signal main() pins, which tells the entrypoint to
+    skip the auto --continue and so start a fresh session.
     """
-    if command == "run":
+    if command in ("run", "new"):
         return ["run", "--rm", "claude", *command_args], True, True
     if command == "build":
         # No service is named, so both images build.
@@ -567,6 +574,11 @@ def main() -> None:
     # either way, so an inherited value from the shell can't silently activate
     # the bridge on a default run.
     environment["COMPOSE_PROFILES"] = ide.PROFILE if args.ide else ""
+    # `new` starts a fresh session: signal the entrypoint to skip the auto
+    # --continue it adds on an argument-less `run`. Pinned to "" otherwise (the
+    # same defensive pin as COMPOSE_PROFILES) so a value inherited from the shell
+    # can't silently suppress the continue on a normal run.
+    environment["CLAUDE_JAIL_NEW_SESSION"] = "1" if args.command == "new" else ""
     if args.ide:
         environment.update(ide.environment())
 

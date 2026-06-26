@@ -34,6 +34,17 @@ class ParseArgsTests(JailTestCase):
         self.assertEqual(args.command, "run")
         self.assertEqual(args.command_args, ["--help"])
 
+    def test_new_keeps_claude_args(self):
+        args = L.parse_args(["-u", "me", "new", "-p", "hi"])
+        self.assertEqual(args.command, "new")
+        self.assertEqual(args.command_args, ["-p", "hi"])
+
+    def test_new_dashdash_stripped(self):
+        # new forwards to claude like run, so it strips the -- separator too.
+        args = L.parse_args(["-u", "me", "new", "--", "--help"])
+        self.assertEqual(args.command, "new")
+        self.assertEqual(args.command_args, ["--help"])
+
     def test_dashdash_kept_for_strict_command(self):
         # -- is a passthrough separator only for run/compose; on the other
         # commands it stays an argument, so `down --` is rejected like `down x`.
@@ -127,6 +138,18 @@ class ResolveCommandTests(JailTestCase):
         # docker run flag — the core safety property. A run always tears down.
         self.assertEqual(
             L.resolve_command("run", ["-p", "hi"]),
+            (["run", "--rm", "claude", "-p", "hi"], True, True),
+        )
+
+    def test_new_shares_run_launch_line(self):
+        # new resolves to the exact run launch line; it diverges only via the
+        # CLAUDE_JAIL_NEW_SESSION env signal main() pins, not the compose args.
+        self.assertEqual(
+            L.resolve_command("new", []),
+            (["run", "--rm", "claude"], True, True),
+        )
+        self.assertEqual(
+            L.resolve_command("new", ["-p", "hi"]),
             (["run", "--rm", "claude", "-p", "hi"], True, True),
         )
 
@@ -446,3 +469,72 @@ class RunComposeTests(JailTestCase):
         self.assertTrue(any(str(c).startswith("/dev/fd/")
                             for c in captured["cmd"]))
         self.assertTrue(captured["pass_fds"])  # read end inherited by docker
+
+
+class MainEnvSignalTests(JailTestCase):
+    """main() pins the env signals that differentiate the launch commands.
+
+    CLAUDE_JAIL_NEW_SESSION is the *only* thing that makes `new` differ from `run`
+    (resolve_command is identical for the two), and the parallel COMPOSE_PROFILES
+    pin keeps a value inherited from the shell from silently activating the ide
+    bridge — or suppressing the auto --continue — on a default run. resolve_command
+    and the whole launch path run for real here; only the docker-touching
+    collaborators are stubbed, and the signal is read back from os.environ at the
+    point run_compose would hand it to `docker compose run`.
+    """
+
+    def _run_main(self, argv, preset=None):
+        captured = {}
+
+        def fake_run_compose(base_cmd, compose_args, override):
+            captured["new_session"] = L.os.environ.get("CLAUDE_JAIL_NEW_SESSION")
+            captured["profiles"] = L.os.environ.get("COMPOSE_PROFILES")
+            return 0
+
+        # The few env keys main() reads back out of build_jail's result.
+        fake_env = {
+            "JAIL_CLAUDE_DIR_BASE": "/x",
+            "JAIL_USER": "me",
+            "COMPOSE_PROJECT_NAME": "proj",
+        }
+        with contextlib.ExitStack() as stack:
+            # patch.dict restores os.environ (incl. the keys main() adds) on exit.
+            stack.enter_context(mock.patch.dict(L.os.environ, clear=False))
+            if preset:
+                L.os.environ.update(preset)
+            stack.enter_context(
+                mock.patch.object(L.sys, "argv", ["claude-jail", *argv]))
+            stack.enter_context(mock.patch.object(L, "require_docker_compose"))
+            stack.enter_context(mock.patch.object(
+                L, "build_jail", return_value=(dict(fake_env), "", [])))
+            stack.enter_context(mock.patch.object(L, "ensure_user_config"))
+            stack.enter_context(
+                mock.patch.object(L.build_mounts, "seed_masked_configs"))
+            stack.enter_context(mock.patch.object(L, "cleanup_side_containers"))
+            stack.enter_context(
+                mock.patch.object(L, "run_compose", side_effect=fake_run_compose))
+            with self.assertRaises(SystemExit) as cm:
+                L.main()
+        self.assertEqual(cm.exception.code, 0)
+        return captured
+
+    def test_new_sets_session_signal(self):
+        self.assertEqual(self._run_main(["new"])["new_session"], "1")
+
+    def test_run_pins_session_signal_empty(self):
+        # Both the explicit `run` and the bare default pin it to "" (resume).
+        self.assertEqual(self._run_main(["run"])["new_session"], "")
+        self.assertEqual(self._run_main([])["new_session"], "")
+
+    def test_run_clobbers_inherited_session_signal(self):
+        # A value inherited from the shell can't silently suppress the resume on a
+        # normal run: main() pins it to "" regardless.
+        captured = self._run_main(["run"],
+                                  preset={"CLAUDE_JAIL_NEW_SESSION": "1"})
+        self.assertEqual(captured["new_session"], "")
+
+    def test_non_ide_run_pins_profiles_empty(self):
+        # The parallel pin: a default (non-ide) run forces COMPOSE_PROFILES to ""
+        # even when the shell exported one.
+        captured = self._run_main(["new"], preset={"COMPOSE_PROFILES": "ide"})
+        self.assertEqual(captured["profiles"], "")

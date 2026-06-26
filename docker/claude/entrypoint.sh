@@ -7,7 +7,9 @@ if [ -n "${CLAUDE_APPEND_SYSTEM_PROMPT:-}" ]; then
     args+=(--append-system-prompt "$CLAUDE_APPEND_SYSTEM_PROMPT")
 fi
 
-if [ "$#" -eq 0 ]; then
+# With no claude args, resume the last session — unless the `new` command set
+# CLAUDE_JAIL_NEW_SESSION, which asks for a fresh session instead.
+if [ "$#" -eq 0 ] && [ -z "${CLAUDE_JAIL_NEW_SESSION:-}" ]; then
     project_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(pwd | sed 's/[^a-zA-Z0-9]/-/g')"
     if compgen -G "$project_dir/*.jsonl" > /dev/null; then
         args+=(--continue)

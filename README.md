@@ -71,14 +71,22 @@ claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subne
 
 Run from the directory that holds your `.claude-jail.json` (or point `-c` at it).
 
-- `run`: starts an interactive session. Anything after the command is forwarded to `claude`;
+- `new`: starts a fresh session. Anything after the command is forwarded to `claude`;
   use `--` to pass a leading-dash argument:
 
   ```sh
-  claude-jail                                 # Resume the last session
-  claude-jail run                             # Start a new one
-  claude-jail -- --help                       # -> `claude --help`
-  claude-jail run -- -p "summarize this repo"
+  claude-jail new
+  claude-jail new -- -p "summarize this repo"
+  ```
+
+- `run` (the default, assumed when no command is given): like `new`, but resumes
+  the last session in this project if there is one:
+
+  ```sh
+  claude-jail run
+  claude-jail
+  claude-jail -- --help
+  claude-jail run -- -p "review the last commit"
   ```
 
 - `build`: build the sandbox images (needed once, or to update the claude

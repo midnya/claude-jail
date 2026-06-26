@@ -147,12 +147,14 @@ def roots_segment(roots: "list[Root]", workdir: str) -> str:
 def packages_segment(packages: "Packages") -> str:
     """A prompt segment reporting the extra packages baked into this jail.
 
-    The project's `packages.apt`/`packages.pip` are installed into the image, so
-    telling the agent what is there saves it rediscovering (or wrongly assuming
-    the absence of) them. The pip line is always emitted — the venv always exists
-    and the base prompt promises this section reports it either way, so the agent
-    knows whether anything extra is installed in it — while the apt line names
-    only the project's extra requests and appears only when there are some.
+    The project's `packages.apt`/`packages.pip`/`packages.npm` are installed into
+    the image, so telling the agent what is there saves it rediscovering (or
+    wrongly assuming the absence of) them. The pip line is always emitted — the
+    venv always exists and the base prompt promises this section reports it either
+    way, so the agent knows whether anything extra is installed in it — while the
+    apt and npm lines name only the project's extra requests and appear only when
+    there are some (node/npm work normally from the base image regardless, so an
+    absent npm line means nothing special is set up rather than nothing exists).
 
     The venv lives at a root-owned path, so the agent (running unprivileged)
     cannot modify it in place, and `--user` installs are disabled image-wide
@@ -170,6 +172,12 @@ def packages_segment(packages: "Packages") -> str:
     if packages.apt:
         listed = ", ".join(f"`{p}`" for p in packages.apt)
         lines.append(f"- System packages (apt): {listed}.")
+    if packages.npm:
+        listed = ", ".join(f"`{p}`" for p in packages.npm)
+        lines.append(f"- Node packages (npm): {listed} — installed via yarn into "
+                     "a read-only tree on your `PATH` (and `NODE_PATH`, for "
+                     "`require()`); install anything new only after asking, per "
+                     "the package rule above.")
     pip_body = (", ".join(f"`{p}`" for p in packages.pip) if packages.pip
                 else "none requested")
     pip_line = f"- Python packages (pip): {pip_body} — {venv_note}"

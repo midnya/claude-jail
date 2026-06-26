@@ -127,7 +127,8 @@ Example:
   "egress": { "default": "deny", "allowed": ["github.com", "pypi.org", "10.0.0.0/8"] },
   "packages": {
     "apt": ["jq", "ripgrep"],
-    "pip": ["requests==2.31.0", "ruff"]
+    "pip": ["requests==2.31.0", "ruff"],
+    "npm": ["typescript", "prettier@^3"]
   },
   "roots": [
     {
@@ -201,6 +202,11 @@ Available keys:
       into a `--system-site-packages` venv; root-owned (so read-only to the
       unprivileged agent in the container), prepended to `PATH`.
     - The venv is read-only and `--user` installs are disabled.
+  - `npm`: Node packages. An entry is an npm name with an optional `@scope/`
+    prefix and an optional `@version` range.
+    - They are installed with the image's bundled [`yarn`](https://yarnpkg.com)
+      into a root-owned tree, with its bin dir prepended to `PATH` and the
+      modules on `NODE_PATH` (so the CLI tools run and the modules `require()`).
   - Note that the package sets are folded into the image tag, so changing a list
     builds a fresh image and leaves the previous one behind. Clean with
     `claude-jail prune`.

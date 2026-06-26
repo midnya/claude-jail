@@ -70,7 +70,8 @@ ENV PATH="/opt/jail-venv/bin:$PATH"
 
 ENV PYTHONNOUSERSITE=1
 RUN uv venv --seed --system-site-packages --python /usr/bin/python3 /opt/jail-venv
-RUN printf 'export PATH="/opt/jail-venv/bin:$PATH"\n' > /etc/profile.d/jail-venv.sh
+# Numbered so login shells source venv then node, leaving node's bin first on PATH
+RUN printf 'export PATH="/opt/jail-venv/bin:$PATH"\n' > /etc/profile.d/10-jail-venv.sh
 
 ARG EXTRA_PIP_PACKAGES=""
 RUN if [ -n "$EXTRA_PIP_PACKAGES" ]; then \
@@ -78,6 +79,23 @@ RUN if [ -n "$EXTRA_PIP_PACKAGES" ]; then \
         printf '%s\n' $EXTRA_PIP_PACKAGES > /tmp/requirements.txt && \
         uv pip install --python /opt/jail-venv/bin/python --no-cache -r /tmp/requirements.txt && \
         rm /tmp/requirements.txt; \
+    fi
+
+# Extra npm packages, installed at build time with the bundled yarn into a
+# root-owned (so read-only to the agent), world-readable tree, prepended to PATH.
+# NODE_PATH makes them require()-able too (CommonJS only; the ESM loader ignores it).
+ENV NODE_PATH="/opt/jail-node/node_modules"
+ENV PATH="/opt/jail-node/node_modules/.bin:$PATH"
+RUN printf 'export PATH="/opt/jail-node/node_modules/.bin:$PATH"\n' > /etc/profile.d/20-jail-node.sh
+
+ARG EXTRA_NPM_PACKAGES=""
+RUN if [ -n "$EXTRA_NPM_PACKAGES" ]; then \
+        set -f; \
+        mkdir -p /opt/jail-node && \
+        printf '{"name":"jail-node","private":true}\n' > /opt/jail-node/package.json && \
+        cd /opt/jail-node && \
+        yarn add --non-interactive --no-progress --cache-folder /tmp/yarn-cache $EXTRA_NPM_PACKAGES && \
+        rm -rf /tmp/yarn-cache; \
     fi
 
 COPY entrypoint.sh /usr/local/bin/claude-jail-entrypoint

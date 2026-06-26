@@ -3,15 +3,16 @@
 build_env.py owns the claude launch settings; this module owns the `packages`
 key — an object grouping packages to install into the jail image by manager. Its
 `apt` list names Debian packages added on top of the fixed set baked into
-docker/claude/Dockerfile, and its `pip` list names Python distributions
-installed into a venv baked into the same image. Both must be installed at
-*build* time: a running jail's only egress is the default-deny Squid proxy, which
-would refuse the Debian mirrors and PyPI, so a startup `apt-get`/`pip install`
-cannot work. The launcher turns the parsed lists into three exports —
-JAIL_APT_PACKAGES and JAIL_PIP_PACKAGES (the install args) and JAIL_IMAGE_SUFFIX
-(a content digest folded into the image tag) — and docker-compose.yml forwards
-them as build args and the image name. die() (from jail_config) reports a
-malformed config.
+docker/claude/Dockerfile, its `pip` list names Python distributions installed
+into a venv baked into the same image, and its `npm` list names Node packages
+installed (with the bundled `yarn`) into a tree baked into it too. All must be
+installed at *build* time: a running jail's only egress is the default-deny Squid
+proxy, which would refuse the Debian mirrors, PyPI and the npm registry, so a
+startup `apt-get`/`pip install`/`yarn add` cannot work. The launcher turns the
+parsed lists into one JAIL_<MANAGER>_PACKAGES install arg each plus
+JAIL_IMAGE_SUFFIX (a content digest folded into the image tag) — and
+docker-compose.yml forwards them as build args and the image name. die() (from
+jail_config) reports a malformed config.
 
 The image tag is content-addressed on the build inputs (claude-jail-<digest>, or
 plain claude-jail for the baseline) so two projects whose images would differ
@@ -51,6 +52,18 @@ The shape each manager accepts:
     and content-address to one image. The leading-alphanumeric rule means an
     entry can never be read as a pip flag, nor as a '-r'/'--index-url' option
     line inside the requirements file.
+  - npm: an optional '@scope/' prefix, a package name, and an optional
+    '@version' range ('eslint@^8.0.0', 'typescript@5.*', '@types/node') —
+    letters (any case), digits and '. _ + ~ ^ < > = * @ -'. '/' is allowed
+    *only* as the scope separator, so the GitHub shorthand 'user/repo' is
+    rejected along with whitespace, every shell metacharacter, ':' (so a URL,
+    VCS ref or 'pkg@npm:alias' cannot pass), and a leading dash. normalize is
+    identity (unlike pip's str.lower): the version/dist-tag after '@' is
+    case-sensitive ('foo@1.0.0-RC1'), and so is the name — npm forbids uppercase
+    in new names but legacy ones like 'JSONStream' keep it, so lowercasing would
+    404 them. The cost is that two casings of one name don't dedupe into a single
+    install/tag, but that surfaces as a build-time error, not a silent fault —
+    cheaper than risking a wrong-cased lookup.
 """
 import re
 from collections import namedtuple
@@ -59,11 +72,13 @@ from jail_config import die, short_digest
 
 # A recognised package manager: the pattern an entry must fully match, the
 # normaliser applied before the set/sort so equivalent spellings collapse to one
-# (identity for apt — its charset is already lowercase; str.lower for pip, whose
-# names are case-insensitive), and a human-readable description of the accepted
-# shape, quoted back to the user when an entry is rejected. Rejecting any key not
-# named here turns a typo (or a not-yet-supported manager) into a hard error
-# rather than a silently-ignored install.
+# (identity for apt — its charset is already lowercase, and for npm — whose name
+# and version/dist-tag are both case-sensitive (legacy mixed-case names like
+# 'JSONStream' exist); str.lower for pip, whose names are case-insensitive), and
+# a human-readable description of the accepted shape,
+# quoted back to the user when an entry is rejected. Rejecting any key not named
+# here turns a typo (or a not-yet-supported manager) into a hard error rather
+# than a silently-ignored install.
 Manager = namedtuple("Manager", ["pattern", "normalize", "accepts"])
 
 _MANAGERS = {
@@ -81,6 +96,16 @@ _MANAGERS = {
                  "specifiers (e.g. 'requests', 'django<5', 'uvicorn[standard]', "
                  "'numpy==1.26.*'); no whitespace, URLs, VCS refs or "
                  "environment markers"),
+    ),
+    "npm": Manager(
+        pattern=re.compile(r"\A(@[A-Za-z0-9._-]+/)?[A-Za-z0-9][A-Za-z0-9._+~^<>=*@-]*\Z"),
+        normalize=str,
+        accepts=("an npm requirement: an optional '@scope/', a package name and "
+                 "optional '@version' range (e.g. 'typescript', '@types/node', "
+                 "'eslint@^8.0.0', 'prettier@~3'); a single comparator only — a "
+                 "compound range needing whitespace or '|' ('>=2 <3', '1||2') "
+                 "can't be expressed; no URLs, VCS refs, aliases, or bare "
+                 "'user/repo' GitHub shorthands"),
     ),
 }
 

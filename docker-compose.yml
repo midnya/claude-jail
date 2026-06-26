@@ -8,6 +8,7 @@ services:
         USER_GID: ${JAIL_GID}
         EXTRA_APT_PACKAGES: ${JAIL_APT_PACKAGES:-}
         EXTRA_PIP_PACKAGES: ${JAIL_PIP_PACKAGES:-}
+        EXTRA_NPM_PACKAGES: ${JAIL_NPM_PACKAGES:-}
 
     networks:
       - jail-internal

@@ -518,12 +518,13 @@ def build_jail(user_flag: "str | None", config_path: str,
         # the content-addressed tag.
         "JAIL_UID": str(ids.uid),
         "JAIL_GID": str(ids.gid),
-        # Extra apt/pip packages, baked into the image at build time. The suffix
-        # content-addresses the tag (over the packages and the uid/gid) so a
-        # differing build input gets its own image rather than clobbering the
+        # Extra apt/pip/npm packages, baked into the image at build time. The
+        # suffix content-addresses the tag (over the packages and the uid/gid) so
+        # a differing build input gets its own image rather than clobbering the
         # shared one (built on first use).
         "JAIL_APT_PACKAGES": " ".join(packages.apt),
         "JAIL_PIP_PACKAGES": " ".join(packages.pip),
+        "JAIL_NPM_PACKAGES": " ".join(packages.npm),
         "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages, ids),
         **build_env.exports(data, config_path),
     }

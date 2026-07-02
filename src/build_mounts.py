@@ -31,8 +31,20 @@ from jail_config import (Root, container_path, die, names_root_itself,
 #   hidden    — content masked (empty) inside the container.
 KEYS = ("read_only", "hidden")
 
+# The repo metadata dir the review feature shadows; the single subtree isolation
+# owns. Named once so the special-casing in requested_for_root / override / the
+# isolation mounts reads from one place instead of scattering the literal.
+GITDIR = ".git"
+
 # Built-in read_only policy applied to every root.
-DEFAULT_READ_ONLY = [".git"]
+DEFAULT_READ_ONLY = [GITDIR]
+
+# Container mount points for git-review isolation (see override()). The real
+# repo's .git is exposed read-only under CVS_GIT_PREFIX + <host path> (mirroring
+# container_path's /workspace + <host path>), and the host spool — where the
+# session drops its bundle — is bound at CVS_SPOOL.
+CVS_GIT_PREFIX = "/cvs/git"
+CVS_SPOOL = "/cvs/spool"
 
 # The jail config file name. Every root masks its own .claude-jail.json — and
 # the active config wherever it sits (see requested_for_root) — even when it is
@@ -52,8 +64,45 @@ EMPTY_MASK = ".claude-jail-empty"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+def under_gitdir(rel: str) -> bool:
+    """True when a root-relative path is .git or something inside it.
+
+    Normalizes first (PurePosixPath), so every spelling of the .git dir — `.git`,
+    `.git/`, `.git/.`, `./.git`, `.git/config` — is recognised the same way. The
+    single predicate the isolate-mode mask machinery shares, so a non-canonical
+    spelling can't be handled one way here and another way there.
+    """
+    return PurePosixPath(rel).parts[:1] == (GITDIR,)
+
+
+def is_gitdir(rel: str) -> bool:
+    """True when a root-relative path is exactly the .git directory itself.
+
+    Any spelling (`.git`, `.git/`, `.git/.`, `.git/./`, `./.git`) normalises here.
+    The launcher's whole-.git-hidden refusal uses this instead of a raw string
+    compare, so a non-canonical spelling can't slip past the guard and leave the
+    real .git exposed read-only at /cvs/git to the sandboxed agent.
+    """
+    return PurePosixPath(rel).parts == (GITDIR,)
+
+
+def masked_rels(root: Root, config_class: "tuple[str, str] | None",
+                isolate: bool = False) -> "list[str]":
+    """The rels masked (emptied) over `root`'s live working tree.
+
+    The always-masked config name, the active config when it sits in this root,
+    and the root's `hidden` entries — minus those under .git in isolate mode,
+    which override() re-masks over the read-only original at /cvs/git rather than
+    over the writable shadow. Delegates to requested_for_root so this is literally
+    the same `hidden` list the mounts are built from (the launcher hands it to
+    review.finalize, whose clobber warning must name exactly the masked files),
+    rather than a parallel re-derivation of the rule that could drift.
+    """
+    return requested_for_root(root, config_class, isolate=isolate)[0]["hidden"]
+
+
 def requested_for_root(root: Root, config_class: "tuple[str, str] | None",
-                       read_only_all: bool = False
+                       read_only_all: bool = False, isolate: bool = False
                        ) -> "tuple[dict[str, list[str]], set[str]]":
     """Per-root requested mounts + the rels to mask even when absent.
 
@@ -69,8 +118,13 @@ def requested_for_root(root: Root, config_class: "tuple[str, str] | None",
     shared with _mask_volumes) is True when a `read_only` entry names the root
     itself; the per-path `read_only` mounts are then dropped as redundant — the
     read-only root bind override() emits covers them — while `hidden` is kept.
+
+    `isolate` (git-review) drops the built-in read-only .git mount: override()
+    replaces it with a writable .git volume and a read-only original elsewhere,
+    so the default would only fight that overmount.
     """
-    requested = {"read_only": list(DEFAULT_READ_ONLY), "hidden": [CONFIG_NAME]}
+    default_ro = [] if isolate else list(DEFAULT_READ_ONLY)
+    requested = {"read_only": default_ro, "hidden": [CONFIG_NAME]}
     mask_absent = {CONFIG_NAME}
     if config_class is not None and config_class[0] == root.dir:
         requested["hidden"].append(config_class[1])
@@ -91,6 +145,14 @@ def requested_for_root(root: Root, config_class: "tuple[str, str] | None",
                 if key == "read_only":
                     continue
                 die(f"{key} path must not be the root itself: {p!r}")
+            if isolate and under_gitdir(p):
+                # In review mode /workspace<root>/.git is the throwaway writable
+                # shadow clone; a read_only/hidden mask inside it would make
+                # `git init`/commit hit EROFS and abort the session. Drop it here so
+                # the overmount stays writable — override() re-applies the `hidden`
+                # ones over the read-only original at /cvs/git instead (see
+                # _cvs_git_masks), so a masked secret in .git stays hidden there too.
+                continue
             requested[key].append(p)
     if read_only_all:
         # The read-only root bind covers .git and every sub-path, so drop the
@@ -201,6 +263,103 @@ def _root_bind(root_dir: str, read_only: bool = False) -> "list[str]":
                         read_only=read_only)
 
 
+def original_git_path(root_dir: str) -> str:
+    """Container path where a root's real .git is exposed read-only for git-review.
+
+    The CVS_GIT_PREFIX mirror of container_path. Shared by the isolation mount
+    (_isolation_volumes) and the launcher's JAIL_GIT_ORIGINAL so the bind target
+    and the in-jail alternate can never drift apart.
+    """
+    return CVS_GIT_PREFIX + root_dir
+
+
+def _isolation_volumes(root_dir: str, gitdir: str) -> "list[str]":
+    """The git-review mounts for one isolated root.
+
+    A throwaway writable .git (`gitdir`, a user-owned host dir the launcher wipes
+    each run) shadows the host's real .git inside the live root bind, so the
+    agent's commits land there and never touch real history. A host bind, not an
+    anonymous volume, so it is writable by the unprivileged container user and its
+    per-run reset is what keeps it from drifting. The real .git is bound read-only
+    under CVS_GIT_PREFIX so the entrypoint can reference-clone from it (and host
+    commits made mid-session stay visible through it). The working tree itself
+    stays the read-write root bind override() already emitted.
+    """
+    git_target = container_path(root_dir) + "/" + GITDIR
+    lines = _bind_stanza(gitdir, git_target, read_only=False)
+    lines += _bind_stanza(f"{root_dir}/{GITDIR}", original_git_path(root_dir),
+                          read_only=True)
+    return lines
+
+
+def _mask_dir_stanza(target: str) -> "list[str]":
+    """A read-only anonymous volume masking a directory's contents (nocopy so it
+    stays empty). Shared by _mask_volumes and _cvs_git_masks so the two directory
+    masks can't drift apart."""
+    return [
+        "      - type: volume",
+        f"        target: {_yaml_path(target)}",
+        "        read_only: true",
+        "        volume:",
+        "          nocopy: true",
+    ]
+
+
+def _mask_present_stanza(host: "Path", target: str) -> "list[str]":
+    """Mask an existing host path at `target`: a nocopy read-only volume for a
+    directory, an empty-file bind for a regular file.
+
+    The single dir-vs-file mask decision, shared by _mask_volumes (masking over
+    the live working tree) and _cvs_git_masks (re-masking over the read-only
+    /cvs/git original), so the two mask pipelines can't drift — a drift risks
+    leaving a `hidden` .git secret readable through /cvs/git in review mode.
+    """
+    if host.is_dir():
+        return _mask_dir_stanza(target)
+    return _bind_stanza(str(SCRIPT_DIR / EMPTY_MASK), target, read_only=True)
+
+
+def _cvs_git_masks(root: Root) -> "list[str]":
+    """Re-apply the root's `hidden` masks that fall under .git over /cvs/git.
+
+    In isolate mode requested_for_root drops every mask under .git (the live .git
+    overmount must stay writable for `git init`/commit), but _isolation_volumes
+    then exposes the real .git read-only at /cvs/git. Without this, a secret the
+    user masked with e.g. `hidden: [".git/config"]` (a credential-helper token, a
+    remote URL with an embedded token) would be readable through /cvs/git the
+    moment review is on — a confidentiality regression versus a normal run. So
+    mask those same `hidden` paths over the original here. `read_only` entries
+    need no mask: /cvs/git is bound read-only wholesale.
+    """
+    lines: "list[str]" = []
+    for p in root.hidden:
+        pp = PurePosixPath(p)
+        if not under_gitdir(p) or is_gitdir(p):
+            continue  # not under .git (or the .git dir itself — nothing to re-mask)
+        # Same symlink-escape guard _mask_volumes applies before binding.
+        resolve_in_root(root.dir, p, "hidden path")
+        rel_in_git = "/".join(pp.parts[1:])             # path inside the .git dir
+        host = Path(root.dir) / GITDIR / rel_in_git     # the real .git content
+        target = original_git_path(root.dir) + "/" + rel_in_git
+        if host.exists():
+            lines += _mask_present_stanza(host, target)
+        else:
+            # Matches _mask_volumes' hard error for a missing `hidden` path.
+            # requested_for_root dropped this .git sub-path before it could reach
+            # that check, so enforce it here — otherwise a typo'd entry (e.g.
+            # `.git/cfg` for `.git/config`) is silently ignored in review mode,
+            # and review mode is exactly what newly exposes the real .git read-only
+            # at /cvs/git: the secret the user meant to mask stays readable to the
+            # sandboxed agent. Fail loudly, as a normal run would.
+            die(f"hidden path not found in the jail: {p}")
+    return lines
+
+
+def _spool_bind(spool: str) -> "list[str]":
+    """The read-write bind of the host review spool the session writes its bundle to."""
+    return _bind_stanza(spool, CVS_SPOOL, read_only=False)
+
+
 def _mask_volumes(mounts: "list[tuple[str, str]]", root_dir: str,
                   mask_absent: "set[str]", root_read_only: bool = False
                   ) -> "tuple[list[str], list[str]]":
@@ -235,39 +394,28 @@ def _mask_volumes(mounts: "list[tuple[str, str]]", root_dir: str,
                 continue
             volumes += _bind_stanza(source, target, read_only=True)
             continue
-        # hidden
-        if host.is_dir():
-            # A fresh anonymous read-only volume masks the directory's contents
-            # and stays unwritable. nocopy keeps it empty; anonymous (no source)
-            # so each mask is isolated and nothing persists across jails or
-            # runs. (A tmpfs can't be made read-only through compose, and
-            # tmpfs-mode is ignored when mounted over an existing directory.)
-            volumes += [
-                "      - type: volume",
-                f"        target: {_yaml_path(target)}",
-                "        read_only: true",
-                "        volume:",
-                "          nocopy: true",
-            ]
-        elif host.exists() or rel in mask_absent:
-            # A volume can't mount over a single file, so bind an empty file
-            # (shipped in the claude-jail repo) over it. Being a regular file on
-            # a read-only mount, writes to a hidden file are refused with EROFS
-            # rather than silently swallowed the way /dev/null swallowed them.
+        # hidden. A directory mask is a fresh anonymous read-only volume (nocopy
+        # keeps it empty, anonymous so nothing persists across jails/runs); a
+        # regular file is masked by binding a shipped empty file (a volume can't
+        # mount over a single file). Both refuse writes with EROFS rather than
+        # swallowing them the way /dev/null did. (A tmpfs can't be made read-only
+        # through compose, and tmpfs-mode is ignored when mounted over a dir.)
+        if host.exists():
+            volumes += _mask_present_stanza(host, target)
+        elif rel in mask_absent:
             # A config-protection path is masked even while absent, so the agent
             # cannot create it.
-            if not host.exists():
-                if root_read_only:
-                    # The read-only root bind already stops the agent from
-                    # planting this config, and docker can't materialise a mask
-                    # target inside a read-only bind — nothing to mask or seed.
-                    continue
-                # The root is a rw bind, so docker materialises this read-only
-                # mask's bind target as a file in the real directory. Left as the
-                # 0-byte file docker creates, it is invalid JSON that makes the
-                # next run from here die in read_config; seeding it with `{}`
-                # first leaves a valid, default config behind instead.
-                seeds.append(source)
+            if root_read_only:
+                # The read-only root bind already stops the agent from planting
+                # this config, and docker can't materialise a mask target inside a
+                # read-only bind — nothing to mask or seed.
+                continue
+            # The root is a rw bind, so docker materialises this read-only mask's
+            # bind target as a file in the real directory. Left as the 0-byte file
+            # docker creates, it is invalid JSON that makes the next run from here
+            # die in read_config; seeding it with `{}` first leaves a valid,
+            # default config behind instead.
+            seeds.append(source)
             volumes += _bind_stanza(str(SCRIPT_DIR / EMPTY_MASK), target,
                                     read_only=True)
         else:
@@ -298,7 +446,8 @@ def seed_masked_configs(paths: "list[str]") -> None:
             continue  # docker materialises the target; the seed is optional
 
 
-def override(roots: "list[Root]", config_class: "tuple[str, str] | None"
+def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
+             isolation: "dict | None" = None
              ) -> "tuple[str, list[str]]":
     """Build the docker compose volume override: a per-root bind + masks.
 
@@ -307,19 +456,37 @@ def override(roots: "list[Root]", config_class: "tuple[str, str] | None"
     container the caller must ensure_empty_mask() (the shipped empty file the
     hidden-file masks bind) and seed_masked_configs(seeds) (the absent
     config-protection files), keeping host writes out of the validation step.
+
+    `isolation` (git-review, default off) is {"repo": <dir>, "gitdir": <host
+    dir>, "spool": <host dir>}: that one root is mounted dev-container style —
+    live working tree, .git shadowed by the throwaway writable `gitdir` (a clone
+    of the read-only original) — and the host spool is bound so the session can
+    drop its bundle for review. (The launcher passes its review context here, so
+    extra keys like `masked`/`base` may ride along and are ignored.)
     """
+    isolate_root = isolation["repo"] if isolation else None
     volumes: "list[str]" = []
     seeds: "list[str]" = []
     for root in roots:
+        isolate = root.dir == isolate_root
         ro_all = root.read_only_all()
         volumes += _root_bind(root.dir, read_only=ro_all)
-        requested, mask_absent = requested_for_root(root, config_class, ro_all)
+        requested, mask_absent = requested_for_root(root, config_class, ro_all,
+                                                    isolate=isolate)
         tree = build_tree(requested)
         mounts: "list[tuple[str, str]]" = []
         resolve(tree, [], False, mounts)
         lines, root_seeds = _mask_volumes(mounts, root.dir, mask_absent, ro_all)
         volumes += lines
         seeds += root_seeds
+        if isolate:
+            volumes += _isolation_volumes(root.dir, isolation["gitdir"])
+            # Re-apply this root's `hidden` masks under .git over the read-only
+            # original at /cvs/git (requested_for_root dropped them from the
+            # writable shadow) so a masked .git secret stays hidden in review mode.
+            volumes += _cvs_git_masks(root)
+    if isolation:
+        volumes += _spool_bind(isolation["spool"])
     if not volumes:
         return "", []
     out: "list[str]" = ["services:", "  claude:", "    volumes:"]

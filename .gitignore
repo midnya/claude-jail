@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code local state (sessions, scheduled-task locks, etc.) — runtime only,
+# never to be committed.
+.claude/

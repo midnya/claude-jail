@@ -38,7 +38,21 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # key — at the top level turns a silently-ignored legacy config or a typo into a
 # hard error, instead of a jail that quietly drops the protections they meant.
 TOP_LEVEL_KEYS = {"user", "uid", "gid", "default_mode", "system_prompts",
-                  "roots", "egress", "packages", "claude_dir_base"}
+                  "roots", "egress", "packages", "claude_dir_base", "review"}
+
+
+def review_enabled(data: "dict", config_file: str) -> bool:
+    """Whether git-review isolation is on (the `review` key, default off).
+
+    When true the config's own root is jailed dev-container style: the working
+    tree stays a live two-way mount, but its .git is shadowed by a throwaway
+    writable clone of the real repo (read-only at /cvs/git), so the session's
+    commits come back as a reviewable bundle instead of touching real history.
+    """
+    value = data.get("review", False)
+    if not isinstance(value, bool):
+        die(f"'review' in {config_file} must be true or false")
+    return value
 
 
 def die(msg: str) -> "None":

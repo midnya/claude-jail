@@ -2,7 +2,8 @@ services:
   claude:
     image: claude-jail${JAIL_IMAGE_SUFFIX:-}
     build:
-      context: ./docker/claude
+      context: .
+      dockerfile: docker/claude/Dockerfile
       args:
         USER_UID: ${JAIL_UID}
         USER_GID: ${JAIL_GID}
@@ -34,6 +35,13 @@ services:
       CLAUDE_JAIL_PERMISSION_MODE: ${CLAUDE_JAIL_PERMISSION_MODE:-}
       CLAUDE_JAIL_NEW_SESSION: ${CLAUDE_JAIL_NEW_SESSION:-}
       CLAUDE_CODE_IDE_HOST_OVERRIDE:
+
+      # git-review isolation: gate plus the in-container original-.git and spool
+      # mount points the entrypoint's jail-workspace init/export read.
+      JAIL_REVIEW: ${JAIL_REVIEW:-}
+      JAIL_WORKDIR: ${JAIL_WORKDIR:-/workspace}
+      JAIL_GIT_ORIGINAL: ${JAIL_GIT_ORIGINAL:-}
+      JAIL_REVIEW_SPOOL: ${JAIL_REVIEW_SPOOL:-}
 
       HTTP_PROXY: http://squid:3128
       HTTPS_PROXY: http://squid:3128

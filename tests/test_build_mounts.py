@@ -349,3 +349,71 @@ class OverrideTests(JailTestCase):
         document, seeds = bm.override([Root(root, ["."], [])], (root, rel))
         self.assertEqual(seeds, [])
         self.assertNotIn(f'target: "/workspace{root}/{rel}"', document)
+
+    def test_isolation_swaps_git_for_writable_gitdir_original_and_spool(self):
+        # git-review: the live root stays read-write, but .git is shadowed by a
+        # writable host gitdir bind, the real .git is exposed read-only under
+        # /cvs/git, and the host spool is bound for the bundle drop.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, ".git"))
+        iso = {"repo": root, "gitdir": "/host/gitdir", "spool": "/host/spool"}
+        document, _ = bm.override([Root(root, [], [])], None, isolation=iso)
+        self.assertIn(f'source: "{root}"', document)            # live working tree
+        self.assertIn(f'target: "/workspace{root}"', document)
+        self.assertIn('source: "/host/gitdir"', document)       # writable .git bind
+        self.assertIn(f'target: "/workspace{root}/.git"', document)
+        self.assertIn(f'source: "{root}/.git"', document)       # real .git, read-only
+        self.assertIn(f'target: "/cvs/git{root}"', document)
+        self.assertIn('source: "/host/spool"', document)        # spool for the bundle
+        self.assertIn('target: "/cvs/spool"', document)
+
+    def test_isolation_only_affects_the_named_root(self):
+        iso = self.tmpdir()
+        other = self.tmpdir()
+        self.mkdir(os.path.join(other, ".git"))
+        isolation = {"repo": iso, "gitdir": "/g", "spool": "/s"}
+        document, _ = bm.override([Root(iso, [], []), Root(other, [], [])], None,
+                                  isolation=isolation)
+        # the non-isolated root keeps the default read-only .git bind
+        self.assertIn(f'source: "{other}/.git"', document)
+        # only the isolated root gets a /cvs/git original
+        self.assertIn(f'target: "/cvs/git{iso}"', document)
+        self.assertNotIn(f'target: "/cvs/git{other}"', document)
+
+    def test_isolation_drops_builtin_readonly_git_mount(self):
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, ".git"))
+        git_target = f'target: "/workspace{root}/.git"'
+        # Plain: .git is the built-in read-only overmount at its natural path,
+        # bound straight from the root's own .git.
+        plain, _ = bm.override([Root(root, [], [])], None)
+        self.assertIn(f'source: "{root}/.git"\n        {git_target}', plain)
+        # Isolated: that overmount is dropped — /workspace<root>/.git is now the
+        # writable gitdir, and the real .git is bound only at /cvs/git.
+        iso = {"repo": root, "gitdir": "/host/gitdir", "spool": "/host/spool"}
+        isolated, _ = bm.override([Root(root, [], [])], None, isolation=iso)
+        self.assertIn(f'source: "/host/gitdir"\n        {git_target}', isolated)
+        self.assertNotIn(f'source: "{root}/.git"\n        {git_target}', isolated)
+
+    def test_isolation_moves_dot_git_masks_off_shadow_onto_cvs_git(self):
+        # A hidden/read_only mask at /workspace<root>/.git/* would stack a read-only
+        # mask inside the writable shadow gitdir and make `git init` hit EROFS, so
+        # isolate mode drops it from the shadow. But the real .git is exposed at
+        # /cvs/git, so a `hidden` secret is re-masked there instead of left exposed.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, ".git"))
+        self.write(os.path.join(root, ".git", "config"), "x")   # must exist to mask
+        self.write(os.path.join(root, ".git", "x"), "y")
+        rt = Root(root, [".git/x"], [".git/config"])   # read_only + hidden under .git
+        iso = {"repo": root, "gitdir": "/g", "spool": "/s"}
+        isolated, _ = bm.override([rt], None, isolation=iso)
+        # nothing masked over the writable shadow .git (would EROFS git init)
+        self.assertNotIn(f'/workspace{root}/.git/config', isolated)
+        self.assertNotIn(f'/workspace{root}/.git/x', isolated)
+        # the hidden secret IS re-masked over the read-only original at /cvs/git
+        self.assertIn(f'target: "/cvs/git{root}/config"', isolated)
+        # the read_only entry is not re-masked: /cvs/git is read-only wholesale
+        self.assertNotIn(f'/cvs/git{root}/x', isolated)
+        # and the same masks ARE emitted over the live .git when NOT isolating
+        plain, _ = bm.override([rt], None)
+        self.assertIn(f'/workspace{root}/.git/config', plain)

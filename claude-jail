@@ -22,6 +22,7 @@ import argparse
 import ipaddress
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,9 +40,10 @@ import ide
 import resolve_claude_dir_base
 import resolve_ids
 import resolve_user
+import review
 from jail_config import (classify_config, config_dir, container_path, die,
                          parse_roots, read_config, resolved_config,
-                         short_digest, user_config_dir)
+                         review_enabled, short_digest, user_config_dir)
 
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
@@ -50,7 +52,7 @@ PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 # with the whole remainder treated as arguments for claude; `compose` is the
 # explicit escape hatch that forwards its args to docker compose verbatim.
 KNOWN_COMMANDS = ("run", "new", "build", "down", "logs", "ps", "prune",
-                  "compose")
+                  "compose", "review", "accept", "reject", "apply")
 
 
 def parse_args(argv: "list[str]") -> argparse.Namespace:
@@ -103,6 +105,14 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              "(off by default). Opens a channel from the sandbox to your editor "
              "(files, diffs, notebook execution). Obviously unsafe."
              "Standard Linux host only for now",
+    )
+    parser.add_argument(
+        "--review", action="store_true",
+        help='force git-review isolation on for this run, as if the config\'s '
+             '"review": true were set: the project is jailed dev-container style '
+             "(live tree, .git shadowed by a throwaway clone of the read-only "
+             "original) and the session's commits come back as a bundle to "
+             "inspect with `claude-jail review`",
     )
     parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
@@ -311,8 +321,9 @@ def resolve_command(command: str,
 
     For `run`, the launch line is always `run --rm claude <args>`, so every
     user-supplied token lands after the service name: it can only reach claude
-    (the entrypoint execs `claude "$@"`), never docker — that is what makes the
-    strict commands strict. The `compose` escape hatch deliberately forgoes this.
+    (the entrypoint runs `claude "$@"` — an exec normally, or a traps-wrapped
+    child in git-review mode), never docker — that is what makes the strict
+    commands strict. The `compose` escape hatch deliberately forgoes this.
 
     `new` shares the `run` launch line verbatim; the two differ only in the
     CLAUDE_JAIL_NEW_SESSION env signal main() pins, which tells the entrypoint to
@@ -459,17 +470,22 @@ def container_workdir(config_path: str) -> str:
 def build_jail(user_flag: "str | None", config_path: str,
                subnet: "str | None" = None,
                claude_dir_base_flag: "str | None" = None,
-               store_must_exist: bool = True
-               ) -> "tuple[dict, str, list[str]]":
+               store_must_exist: bool = True,
+               review_flag: bool = False
+               ) -> "tuple[dict, str, list[str], dict | None]":
     """Validate the config and assemble the launch environment and mount override.
 
     Resolves the jail roots from the config (or its own directory), confines the
     system prompt, and masks the active config in whichever root holds it. Runs
     entirely before any host state is touched, so a bad config aborts via die()
-    here. Returns (environment, override, seeds): the jail user, compose project
-    name and config store base live in environment (JAIL_USER /
+    here. Returns (environment, override, seeds, review_ctx): the jail user,
+    compose project name and config store base live in environment (JAIL_USER /
     COMPOSE_PROJECT_NAME / JAIL_CLAUDE_DIR_BASE); seeds lists absent config files
-    the caller creates as `{}` before a container launch.
+    the caller creates as `{}` before a container launch; review_ctx is the
+    git-review {"repo", "spool"} when isolation is on (else None), telling main()
+    where to seed the base manifest and adopt the session's bundle. `review_flag`
+    (the --review CLI flag) forces that isolation on even when the config's
+    `review` key is unset.
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
@@ -528,8 +544,75 @@ def build_jail(user_flag: "str | None", config_path: str,
         "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages, ids),
         **build_env.exports(data, config_path),
     }
-    override, seeds = build_mounts.override(roots, config_class)
-    return environment, override, seeds
+    # git-review isolation (opt-in): jail the config's own root dev-container
+    # style — live working tree, .git shadowed by a throwaway clone of the
+    # read-only original at /cvs/git — and route the session's commits back as a
+    # reviewable bundle dropped in a host spool. The isolated root is the config's
+    # own directory (the project repo).
+    review_ctx = None
+    # review_enabled runs unconditionally so a bad `review` value still fails on any
+    # command; the --review flag forces it on regardless of the config. The
+    # isolation setup below — and its .git/read_only preconditions, which die() —
+    # only run for a command that actually launches a session (store_must_exist):
+    # down/logs/ps neither capture nor need review and must keep working even when
+    # the repo's .git is a worktree gitfile or the project dir is gone.
+    review_on = review_enabled(data, config_path) or review_flag
+    if review_on and store_must_exist:
+        iso_root = next((r for r in roots if r.dir == config_dir(config_path)),
+                        None)
+        if iso_root is None:
+            die("review needs the config's own directory to be a jail root")
+        # The shadow-.git scheme needs a normal .git *directory* to overmount and a
+        # writable working tree to commit into. Reject the cases that would only
+        # surface later as an opaque docker mount error or an in-jail init crash:
+        # a linked-worktree gitfile (or no repo at all), and a read-only root.
+        if not (Path(iso_root.dir) / build_mounts.GITDIR).is_dir():
+            die(f"review needs {iso_root.dir}/{build_mounts.GITDIR} to be a normal "
+                "git directory; a linked-worktree gitfile or non-git root is "
+                "unsupported")
+        if iso_root.read_only_all():
+            die("review needs a writable project root, but this root is read_only")
+        # A `hidden: [".git"]` (whole-.git) mask can't be honoured in review mode:
+        # requested_for_root drops it from the writable shadow, and the real .git
+        # is exposed read-only at /cvs/git so the shadow can borrow its objects —
+        # so the mask that emptied .git in a normal run would silently stop
+        # applying, leaking the real .git (credentials in .git/config, remote
+        # URLs). Rather than leak, refuse; the user can hide specific .git
+        # sub-paths (review re-masks those over /cvs/git) or drop review here.
+        if any(build_mounts.is_gitdir(h) for h in iso_root.hidden):
+            die("review can't isolate a root whose whole .git is hidden — it would "
+                "expose the real .git at /cvs/git; hide specific .git sub-paths "
+                "(e.g. .git/config) instead, or turn review off for this repo")
+        # Only a launch has a resolved store base; without one we leave isolation
+        # off here and let main()'s launch path report the missing base. The per-run
+        # spool lives under the host-only review store (review._spool — a sibling of
+        # the .claude bind, so the agent can't reach other runs' bundles) and is
+        # keyed by jail_id *and* this launcher's pid: two concurrent runs of the
+        # same repo then get separate gitdirs/handshake files instead of one
+        # wiping the other's live, bind-mounted .git mid-session.
+        if claude_dir_base:
+            spool = str(review.per_run_spool(claude_dir_base, jail_user,
+                                             jail_id, os.getpid()))
+            # Reclaim per-run spools left by crashed runs of this repo before adding
+            # ours, so pid-keyed dirs don't accumulate (best-effort, dead pids only).
+            review.sweep_stale_spools(claude_dir_base, jail_user, jail_id,
+                                      keep=Path(spool).name)
+            gitdir = str(Path(spool) / "gitdir")
+            # One context object serves both consumers: build_mounts.override reads
+            # repo/gitdir/spool; review.prepare/finalize read the same, plus the
+            # `masked` rels finalize warns about and the `base` prepare stashes on
+            # it. No second parallel dict to keep in sync.
+            review_ctx = {"repo": iso_root.dir, "gitdir": gitdir, "spool": spool,
+                          "masked": build_mounts.masked_rels(
+                              iso_root, config_class, isolate=True)}
+            environment["JAIL_GIT_ORIGINAL"] = build_mounts.original_git_path(
+                iso_root.dir)
+            environment["JAIL_REVIEW_SPOOL"] = build_mounts.CVS_SPOOL
+    # Pinned (the COMPOSE_PROFILES-style defensive pin) so an inherited JAIL_REVIEW
+    # can't switch the entrypoint's git-review path on for a non-review run.
+    environment["JAIL_REVIEW"] = "1" if review_ctx else ""
+    override, seeds = build_mounts.override(roots, config_class, review_ctx)
+    return environment, override, seeds, review_ctx
 
 
 def ensure_user_config(home: Path, jail_user: str) -> None:
@@ -554,19 +637,43 @@ def main() -> None:
         if args.command_args:
             die("prune accepts no arguments")
         sys.exit(prune_images())
+    # The config the run is anchored on: an explicit -c, else .claude-jail.json in
+    # the cwd. Computed once here for every command past prune — review's
+    # short-circuit and the launch path below both read it.
+    config_path = args.config or os.path.join(os.getcwd(),
+                                              build_mounts.CONFIG_NAME)
+    # review/accept/reject/apply act on the host repo the config anchors —
+    # importing, classifying and applying a jailed session's bundle. They never
+    # touch docker, so like prune they short-circuit before
+    # require_docker_compose() and all the compose/mount machinery.
+    if args.command in review.COMMANDS:
+        sys.exit(review.dispatch(args.command, args.command_args, config_path,
+                                 args.user, args.claude_dir_base))
     require_docker_compose()
     if not PROMPT_FILE.is_file():
         die(f"base system prompt not found: {PROMPT_FILE}")
-
-    config_path = args.config or os.path.join(os.getcwd(), ".claude-jail.json")
     # Resolve the command before the config: only a launch mounts the per-user
     # store, so only a launch requires a configured claude_dir_base to already
     # exist — a down/logs/ps must still work when it points at a now-missing dir.
     compose_args, launches, teardown = resolve_command(args.command,
                                                        args.command_args)
-    environment, override, seeds = build_jail(args.user, config_path,
-                                              args.subnet, args.claude_dir_base,
-                                              store_must_exist=launches)
+    environment, override, seeds, review_ctx = build_jail(
+        args.user, config_path, args.subnet, args.claude_dir_base,
+        store_must_exist=launches, review_flag=args.review)
+    # Review capture only works for a one-shot session: the launcher seeds the
+    # spool, waits for the container, then adopts the bundle on teardown. A
+    # persistent launch (up/start/watch) would prepare the gitdir but never
+    # finalize — silently dropping the work — so refuse it up front.
+    if review_ctx and launches and not teardown:
+        die("review isolation is only supported for one-shot run/new sessions, "
+            "not for up/start/watch")
+    # The raw `compose` escape hatch can detach (`run -d`), override the entrypoint,
+    # or skip --rm, so the launcher can't guarantee the capture handshake — and a
+    # detached run would have finalize()+spool-cleanup race the still-live
+    # container. Review is only supported through the strict run/new commands.
+    if review_ctx and args.command == "compose":
+        die("review isolation is not supported via the raw `compose` escape hatch; "
+            "use the strict run/new commands")
     # The opt-in IDE bridge is wholly owned by the `ide` package: its env
     # additions point the in-jail CLI at the relay; everything else (the host
     # helper, the lockfile mirror dir) lives behind start()/stop() below.
@@ -605,6 +712,10 @@ def main() -> None:
         if override:
             build_mounts.ensure_empty_mask()
         build_mounts.seed_masked_configs(seeds)
+        if review_ctx:
+            # Seed the spool's base manifest so the in-jail export can bundle only
+            # the session's new commits (the delta the user doesn't already have).
+            review.prepare(review_ctx)
         if args.ide:
             ide_mirror = ide.prepare(Path(base), environment["JAIL_USER"])
             # Skip the bring-up when the bridge can't reach the editor (non-Linux
@@ -622,6 +733,33 @@ def main() -> None:
         # the containers running alongside claude, like the other side services.
         if ide_mirror is not None and teardown:
             ide.cleanup(ide_mirror)
+    # Adopt the bundle the review container dropped in the spool — host side,
+    # where .git is writable: name it, fold in the manifest, and import it into
+    # the unreviewed quarantine for `claude-jail review`. Only after a one-shot
+    # session (teardown), like the side-container reap below.
+    if review_ctx and teardown:
+        store = user_config_dir(Path(environment["JAIL_CLAUDE_DIR_BASE"]),
+                                environment["JAIL_USER"])
+        name = review.finalize(review_ctx["repo"], review_ctx["spool"],
+                               review_ctx.get("base", {}),
+                               review.session_name(store,
+                                                   environment["JAIL_WORKDIR"]),
+                               masked=review_ctx.get("masked", ()))
+        if name:
+            print(f"Review: captured bundle {name!r}; run "
+                  f"`claude-jail review` to inspect.", file=sys.stderr)
+        # The per-run spool (the throwaway gitdir plus handshake files) is
+        # disposable once the bundle is adopted into the host-only store; the
+        # pid-keyed dirs would otherwise pile up across one-shot runs. A removal
+        # failure (e.g. the container wrote the gitdir as a uid this user can't
+        # remove, under a custom uid/gid) must not abort — the bundle is already
+        # captured — but warn so the leak isn't silent, matching prepare()'s loud
+        # stale-gitdir guard; a later run's sweep_stale_spools retries it.
+        spool_dir = review_ctx["spool"]
+        shutil.rmtree(spool_dir, ignore_errors=True)
+        if os.path.exists(spool_dir):
+            print(f"Review: could not remove the per-run spool at {spool_dir}; "
+                  "remove it by hand if it lingers.", file=sys.stderr)
     # up / start / watch are left running deliberately, so they get no teardown.
     if teardown:
         cleanup_side_containers(base_cmd, environment["COMPOSE_PROJECT_NAME"])

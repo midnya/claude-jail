@@ -2,7 +2,8 @@
 **/__pycache__
 *.pyc
 tests
-docker
+docker/*
+!docker/claude
 .claude
 .claude-jail.json
 README.md

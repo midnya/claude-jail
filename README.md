@@ -4,6 +4,7 @@ Run Claude Code inside a locked-down Docker container.
 
 Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).
 Requires Python 3, with no other dependencies.
+Very git centric. I have no genuine experience with other VCS to check for correctness.
 
 Still in active development; bug reports, feature requests, and PRs are most welcome!
 
@@ -20,6 +21,9 @@ Because most of Claude Code features rely on arbitrary code execution, we try to
 the attack surface as much as possible, while still offering convenience for day-to-day
 operations:
 - Filesystem protection: bypasses Claude's sandbox feature and relies on Docker's instead.
+  - CVS directories are read-only by default.
+    - Opt-in "review" mode where modifications to .git are bundled
+      after container's teardown and available for human review.
   - For convenience, `/tmp` is a persisted volume that is shared per-workspace,
     between jail instances.
 - Network isolation: the jail container sits on an `internal` Docker network.
@@ -114,6 +118,32 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
 ```sh
 claude-jail -c ~/code/myproject/.claude-jail.json
 ```
+
+### Review
+
+When a session runs with `review` on, the commits come back as a quarantined
+git bundle instead of modifying the actual history:
+
+- `review`: summarise the pending bundles, each with a per-branch classification
+  (new / fast-forward / divergent / rewrite) and any hazards (a re-pointed tag, a
+  `replace` ref, a branch the session deleted):
+
+  ```sh
+  claude-jail review --list     # List the available bundles
+  claude-jail review <bundle>   # `git diff` of a specific bundle
+  claude-jail review            # one pending bundle -> its diff; several -> the list
+  ```
+
+- `accept <bundle>` / `reject <bundle>`: accept a bundle for landing / discard
+  it.
+
+- `apply [bundle...]`: Merge one or more accepted bundles into the actual tree.
+  A history rewrite is refused unless `--allow-rewrite` is passed:
+
+  ```sh
+  claude-jail apply                           # every accepted bundle
+  claude-jail apply <bundle> --allow-rewrite
+  ```
 
 ## Configuration
 
@@ -244,3 +274,10 @@ Notes:
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
 - A missing or empty `system_prompts.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.
+
+## "Why `claude-jail` instead of OpenShell?"
+
+I believe that one should not rely on an alpha sandboxing tool that requires a mermaid diagram to understand. On another note, back-and-forth interactions (the main selling point of Claude Code) with OpenShell is awkward.
+
+It's probably a very good tool for many people, but for this use case, I'd prefer some
+good old Python puppeting a sandbox which, if broken, would be a good candidate for the CVE of the decade.

@@ -506,7 +506,7 @@ class MainEnvSignalTests(JailTestCase):
                 mock.patch.object(L.sys, "argv", ["claude-jail", *argv]))
             stack.enter_context(mock.patch.object(L, "require_docker_compose"))
             stack.enter_context(mock.patch.object(
-                L, "build_jail", return_value=(dict(fake_env), "", [])))
+                L, "build_jail", return_value=(dict(fake_env), "", [], None)))
             stack.enter_context(mock.patch.object(L, "ensure_user_config"))
             stack.enter_context(
                 mock.patch.object(L.build_mounts, "seed_masked_configs"))
@@ -538,3 +538,197 @@ class MainEnvSignalTests(JailTestCase):
         # even when the shell exported one.
         captured = self._run_main(["new"], preset={"COMPOSE_PROFILES": "ide"})
         self.assertEqual(captured["profiles"], "")
+
+
+class ReviewIsolationBuildTests(JailTestCase):
+    """build_jail wires git-review isolation into the env, override and ctx."""
+
+    def _config(self, body):
+        proj = self.tmpdir()
+        # review requires a normal .git directory to shadow (build_jail rejects a
+        # linked-worktree gitfile or non-git root), so give the project one.
+        self.mkdir(os.path.join(proj, ".git"))
+        cfg = self.write(os.path.join(proj, ".claude-jail.json"), body)
+        return proj, cfg
+
+    def test_review_isolation_wired(self):
+        base = self.tmpdir()
+        proj, cfg = self._config('{"user": "t", "review": true}')
+        env, override, _seeds, review_ctx = L.build_jail(
+            None, cfg, None, base, store_must_exist=True)
+        self.assertEqual(review_ctx["repo"], proj)
+        self.assertEqual(env["JAIL_REVIEW"], "1")
+        self.assertTrue(env["JAIL_GIT_ORIGINAL"].endswith(proj))
+        self.assertEqual(env["JAIL_REVIEW_SPOOL"], "/cvs/spool")
+        # the override carries the isolation mounts (real .git, gitdir, spool)
+        self.assertIn(f"/cvs/git{proj}", override)
+        self.assertIn(review_ctx["gitdir"], override)
+        self.assertIn("/cvs/spool", override)
+
+    def test_review_off_by_default(self):
+        base = self.tmpdir()
+        _proj, cfg = self._config('{"user": "t"}')
+        env, override, _seeds, review_ctx = L.build_jail(
+            None, cfg, None, base, store_must_exist=True)
+        self.assertIsNone(review_ctx)
+        self.assertEqual(env["JAIL_REVIEW"], "")
+        self.assertNotIn("/cvs/git", override)
+
+    def test_review_flag_forces_isolation_without_config_key(self):
+        base = self.tmpdir()
+        proj, cfg = self._config('{"user": "t"}')
+        env, _override, _seeds, review_ctx = L.build_jail(
+            None, cfg, None, base, store_must_exist=True, review_flag=True)
+        self.assertEqual(review_ctx["repo"], proj)
+        self.assertEqual(env["JAIL_REVIEW"], "1")
+
+    def test_inherited_jail_review_does_not_leak_in(self):
+        # The defensive pin: a JAIL_REVIEW exported in the shell must not switch
+        # the entrypoint's git-review path on for a non-review run.
+        base = self.tmpdir()
+        _proj, cfg = self._config('{"user": "t"}')
+        with mock.patch.dict(L.os.environ, {"JAIL_REVIEW": "1"}, clear=False):
+            env, _o, _s, review_ctx = L.build_jail(
+                None, cfg, None, base, store_must_exist=True)
+        self.assertIsNone(review_ctx)
+        self.assertEqual(env["JAIL_REVIEW"], "")
+
+    def test_review_requires_config_dir_among_roots(self):
+        # review isolates the config's own directory; if that dir isn't a root,
+        # there's nothing to isolate and the config is rejected.
+        base = self.tmpdir()
+        proj, cfg = self._config(
+            '{"user": "t", "review": true, "roots": ["sub"]}')
+        self.mkdir(os.path.join(proj, "sub"))
+        with self.assertDies(
+                "review needs the config's own directory to be a jail root"):
+            L.build_jail(None, cfg, None, base, store_must_exist=True)
+
+    def test_review_isolation_deferred_when_base_unresolved(self):
+        # review on for a launch (store_must_exist=True) but no store base
+        # resolvable (no flag, no config key, no $HOME): the `if claude_dir_base:`
+        # guard leaves isolation off so main()'s launch path reports the base.
+        # store_must_exist MUST be True: with False the whole isolation block is
+        # short-circuited earlier, so the test would pass without ever reaching the
+        # guard it names (and would stay green even if that guard were removed).
+        _proj, cfg = self._config('{"user": "t", "review": true}')
+        with mock.patch.dict(L.os.environ, clear=False):
+            L.os.environ.pop("HOME", None)
+            env, _o, _s, review_ctx = L.build_jail(
+                None, cfg, None, None, store_must_exist=True)
+        self.assertIsNone(review_ctx)
+        self.assertEqual(env["JAIL_REVIEW"], "")
+        self.assertNotIn("JAIL_GIT_ORIGINAL", env)
+
+    def test_review_rejects_linked_worktree_gitfile_root(self):
+        # A linked-worktree root has .git as a *file*; the shadow-.git overmount
+        # needs a directory, so build_jail refuses up front rather than producing
+        # an opaque docker mount error later.
+        base = self.tmpdir()
+        proj = self.tmpdir()
+        self.write(os.path.join(proj, ".git"), "gitdir: /elsewhere/.git\n")
+        cfg = self.write(os.path.join(proj, ".claude-jail.json"),
+                         '{"user": "t", "review": true}')
+        with self.assertDies("normal git directory"):
+            L.build_jail(None, cfg, None, base, store_must_exist=True)
+
+    def test_review_rejects_read_only_root(self):
+        # A read-only working tree can't take the agent's commits, so review on a
+        # root the config pins read_only is refused.
+        base = self.tmpdir()
+        proj, cfg = self._config(
+            '{"user": "t", "review": true, '
+            '"roots": [{"path": ".", "read_only": ["."]}]}')
+        with self.assertDies("writable project root"):
+            L.build_jail(None, cfg, None, base, store_must_exist=True)
+
+    def test_review_rejects_whole_git_hidden(self):
+        # A `hidden: [".git"]` mask can't be honoured in review mode (the real .git
+        # is exposed read-only at /cvs/git for object borrowing), so it would leak
+        # the .git the user meant to hide — build_jail refuses rather than leak.
+        base = self.tmpdir()
+        proj, cfg = self._config(
+            '{"user": "t", "review": true, '
+            '"roots": [{"path": ".", "hidden": [".git"]}]}')
+        with self.assertDies("whole .git is hidden"):
+            L.build_jail(None, cfg, None, base, store_must_exist=True)
+
+    def test_review_rejects_whole_git_hidden_noncanonical(self):
+        # The refusal must normalize like the mask machinery: a non-canonical
+        # spelling such as ".git/." still masks the entire .git in a normal run, so
+        # review must refuse it too — a raw string compare would let it slip past
+        # and leave the real .git exposed read-only at /cvs/git to the agent.
+        base = self.tmpdir()
+        proj, cfg = self._config(
+            '{"user": "t", "review": true, '
+            '"roots": [{"path": ".", "hidden": [".git/."]}]}')
+        with self.assertDies("whole .git is hidden"):
+            L.build_jail(None, cfg, None, base, store_must_exist=True)
+
+    def test_review_allows_git_subpath_hidden(self):
+        # Hiding a specific .git sub-path is fine — override() re-masks it over
+        # /cvs/git — so review is NOT refused for it.
+        base = self.tmpdir()
+        proj, cfg = self._config(
+            '{"user": "t", "review": true, '
+            '"roots": [{"path": ".", "hidden": [".git/config"]}]}')
+        # The masked .git sub-path must exist to be re-masked over /cvs/git; an
+        # absent one is a hard error (a typo), just as in a normal run.
+        self.write(os.path.join(proj, ".git", "config"), "x")
+        _env, _o, _s, review_ctx = L.build_jail(
+            None, cfg, None, base, store_must_exist=True)
+        self.assertIsNotNone(review_ctx)
+
+    def test_review_rejects_absent_git_subpath_hidden(self):
+        # A mistyped `.git/...` hidden entry must fail loudly in review mode, not
+        # be silently dropped — otherwise the real .git sub-path it meant to hide
+        # stays readable to the agent through the read-only /cvs/git mount.
+        base = self.tmpdir()
+        _proj, cfg = self._config(
+            '{"user": "t", "review": true, '
+            '"roots": [{"path": ".", "hidden": [".git/nonexistent"]}]}')
+        with self.assertDies("hidden path not found"):
+            L.build_jail(None, cfg, None, base, store_must_exist=True)
+
+
+class ReviewCommandRoutingTests(JailTestCase):
+    """main() sends review commands to review.dispatch and never touches docker."""
+
+    def test_review_command_routes_to_dispatch_before_docker(self):
+        seen = {}
+
+        def fake_dispatch(command, command_args, config_path, user, base):
+            seen.update(command=command, args=list(command_args))
+            return 7
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                L.sys, "argv", ["claude-jail", "review", "b"]))
+            stack.enter_context(mock.patch.object(
+                L, "require_docker_compose",
+                side_effect=AssertionError("docker must not be touched")))
+            stack.enter_context(
+                mock.patch.object(L.review, "dispatch", fake_dispatch))
+            with self.assertRaises(SystemExit) as cm:
+                L.main()
+        self.assertEqual(cm.exception.code, 7)
+        self.assertEqual(seen, {"command": "review", "args": ["b"]})
+
+    def test_review_refused_on_persistent_launch(self):
+        # `compose -- up` launches but never tears down, so review capture could
+        # never finalize: main() refuses it before launching anything.
+        review_ctx = {"repo": "/r", "spool": "/s", "gitdir": "/g"}
+        fake_env = {"JAIL_CLAUDE_DIR_BASE": "/x", "JAIL_USER": "me",
+                    "COMPOSE_PROJECT_NAME": "proj", "JAIL_WORKDIR": "/workspace"}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                L.sys, "argv", ["claude-jail", "compose", "--", "up"]))
+            stack.enter_context(mock.patch.object(L, "require_docker_compose"))
+            stack.enter_context(mock.patch.object(
+                L, "build_jail",
+                return_value=(dict(fake_env), "", [], review_ctx)))
+            stack.enter_context(mock.patch.object(
+                L, "run_compose",
+                side_effect=AssertionError("must not launch")))
+            with self.assertDies("only supported for one-shot"):
+                L.main()

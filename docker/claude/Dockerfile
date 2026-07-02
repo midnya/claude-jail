@@ -98,8 +98,10 @@ RUN if [ -n "$EXTRA_NPM_PACKAGES" ]; then \
         rm -rf /tmp/yarn-cache; \
     fi
 
-COPY entrypoint.sh /usr/local/bin/claude-jail-entrypoint
-RUN chmod +x /usr/local/bin/claude-jail-entrypoint
+# Build context is the repo root (see docker-compose.yml) so src/ is reachable.
+COPY docker/claude/entrypoint.sh /usr/local/bin/claude-jail-entrypoint
+COPY src/jail_workspace.py /usr/local/bin/jail-workspace
+RUN chmod +x /usr/local/bin/claude-jail-entrypoint /usr/local/bin/jail-workspace
 
 USER claude
 

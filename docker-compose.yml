@@ -36,6 +36,12 @@ services:
       CLAUDE_JAIL_NEW_SESSION: ${CLAUDE_JAIL_NEW_SESSION:-}
       CLAUDE_CODE_IDE_HOST_OVERRIDE:
 
+      # e2e test seam. CLAUDE_JAIL_AGENT_CMD overrides the agent binary, but the
+      # entrypoint honours it only when CLAUDE_JAIL_E2E is "1" — both are pinned
+      # off by the launcher on a normal run, and forwarded together only under e2e.
+      CLAUDE_JAIL_E2E: ${CLAUDE_JAIL_E2E:-}
+      CLAUDE_JAIL_AGENT_CMD: ${CLAUDE_JAIL_AGENT_CMD:-}
+
       # git-review isolation: gate plus the in-container original-.git and spool
       # mount points the entrypoint's jail-workspace init/export read.
       JAIL_REVIEW: ${JAIL_REVIEW:-}

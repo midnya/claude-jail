@@ -4,6 +4,7 @@
 tests
 docker/*
 !docker/claude
+!docker/claude-jail-dind
 .claude
 .claude-jail.json
 README.md

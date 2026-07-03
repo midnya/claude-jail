@@ -46,6 +46,11 @@ from jail_config import (classify_config, config_dir, container_path, die,
                          review_enabled, short_digest, user_config_dir)
 
 COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
+# The `--dind` overlay: merged over COMPOSE_FILE (as a second `-f`, before the
+# mount override) so the whole `claude` service is reused and only gains the
+# claude-jail-dind image + privilege. See docker/claude-jail-dind/.
+DIND_OVERRIDE = SCRIPT_DIR / "docker" / "claude-jail-dind" / "compose.override.yml"
+DIND_DOCKERFILE = SCRIPT_DIR / "docker" / "claude-jail-dind" / "Dockerfile"
 PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 
 # The strict command surface. Anything not naming one of these defaults to `run`
@@ -53,6 +58,15 @@ PROMPT_FILE = SCRIPT_DIR / "system-prompt.md"
 # explicit escape hatch that forwards its args to docker compose verbatim.
 KNOWN_COMMANDS = ("run", "new", "build", "down", "logs", "ps", "prune",
                   "compose", "review", "accept", "reject", "apply")
+
+# The commands `--dind` applies to: the ones that build or launch the jail
+# container. An allow-list, not a deny-list, so it is fail-closed — a command
+# added to KNOWN_COMMANDS later is rejected under `--dind` until it is explicitly
+# opted in here, never silently stripped of the flag. Everything else (prune's
+# host-wide image GC, the review-family host-side bundle ops, and the raw
+# `compose` escape hatch — whose verbatim args bypass the overlay merge) neither
+# builds nor launches the dind image, so `--dind` is meaningless for them.
+_DIND_COMMANDS = frozenset({"run", "new", "build", "down", "logs", "ps"})
 
 
 def parse_args(argv: "list[str]") -> argparse.Namespace:
@@ -115,6 +129,15 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              "inspect with `claude-jail review`",
     )
     parser.add_argument(
+        "--dind", action="store_true",
+        help="run the jail on the claude-jail-dind image (the prod image plus a "
+             "rootless Docker daemon) instead of the normal one, so the session "
+             "has a working Docker to launch nested containers. Same `claude` "
+             "service in every other respect; runs the container privileged, so "
+             "it is for dev/testing only. A launch builds the image on demand; "
+             "`--dind build` (re)builds it explicitly",
+    )
+    parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
         help="run (default) | new | build | down | logs | ps | prune | "
              "compose -- <args>; "
@@ -152,6 +175,13 @@ def _feed_pipe(fd: int, data: bytes) -> None:
         pass  # docker closed the override pipe before reading it all
     finally:
         os.close(fd)
+
+
+def _base_compose_cmd() -> "list[str]":
+    """`docker compose -f <base compose file>`: the prefix every non-dind compose
+    invocation shares — main()'s launch line and the dind base build both build on
+    it, so a global compose flag added here reaches both instead of only one."""
+    return ["docker", "compose", "-f", str(COMPOSE_FILE)]
 
 
 def run_compose(base_cmd: "list[str]", compose_args: "list[str]",
@@ -238,20 +268,27 @@ def require_docker_compose() -> None:
 
 
 # The content-addressed package images build_packages.image_suffix mints:
-# claude-jail-<8 hex>. Anchored so it matches neither the base `claude-jail`
-# image nor the `claude-jail-squid` side service — only the per-package-set
-# variants that pile up as orphans when a project's `packages` list changes.
-_PACKAGE_IMAGE = re.compile(r"\Aclaude-jail-[0-9a-f]{8}\Z")
+# claude-jail-<8 hex>, plus the derived claude-jail-dind-<8 hex> a `--dind` build
+# layers on top. Anchored so it matches neither the base `claude-jail` /
+# `claude-jail-dind` singletons nor the `claude-jail-squid` side service — only
+# the per-package-set variants that pile up as orphans when a project's
+# `packages` list (or uid/gid) changes.
+_PACKAGE_IMAGE = re.compile(r"\Aclaude-jail(?:-dind)?-[0-9a-f]{8}\Z")
 
 
 def prune_images() -> int:
-    """Remove the content-addressed package images (claude-jail-<digest>).
+    """Remove the content-addressed package images (claude-jail[-dind]-<digest>).
 
-    A changed `packages` list mints a fresh claude-jail-<8 hex> image and leaves
-    the previous tag behind with no GC path; this reclaims them. The base
-    `claude-jail` image and the `claude-jail-squid` side service are left alone —
-    singletons that `build` refreshes, not accumulators. An image still used by a
-    live session is kept (docker refuses to remove it) and reported on its line.
+    A changed `packages` list (or uid/gid) mints a fresh claude-jail-<8 hex>
+    image — and a like-suffixed claude-jail-dind-<8 hex> under `--dind` — and
+    leaves the previous tags behind with no GC path; this reclaims them. The base
+    `claude-jail` / `claude-jail-dind` and the `claude-jail-squid` side service
+    are left alone — singletons that `build` refreshes, not accumulators. A dind
+    image derives FROM its like-suffixed base, so a child must be removed before
+    its base or docker refuses the base ('image has dependent child images'); the
+    sort key orders every `-dind-` ref ahead of the bases in the single
+    `image rm`. An image still used by a live session is kept (docker refuses to
+    remove it) and reported on its line.
     """
     try:
         listed = subprocess.run(
@@ -262,13 +299,48 @@ def prune_images() -> int:
     if listed.returncode != 0:
         die("could not list docker images to prune")
     names = sorted({repo for repo in listed.stdout.split()
-                    if _PACKAGE_IMAGE.match(repo)})
+                    if _PACKAGE_IMAGE.match(repo)},
+                   key=lambda n: (0 if "-dind-" in n else 1, n))
     if not names:
         print("No claude-jail package images to prune.")
         return 0
     print(f"Pruning {len(names)} claude-jail package image(s): "
           f"{', '.join(names)}")
     return subprocess.run(["docker", "image", "rm", *names]).returncode
+
+
+# The dind nested-image-store volumes: claude-jail-dind-<JAIL_ID><suffix>. Anchored
+# on the dind- prefix so it matches none of the base jail-tmp/squid-logs/dns-logs
+# volumes — only the per-config (and per-suffix) dind data-roots.
+_DIND_VOLUME = re.compile(r"\Aclaude-jail-dind-.+\Z")
+
+
+def prune_volumes() -> int:
+    """Remove the dind nested-image-store volumes (claude-jail-dind-<...>).
+
+    The --dind data-root volumes are the one jail artifact with no other GC path:
+    a changed config path, `packages` list, or uid/gid mints a fresh
+    claude-jail-dind-<JAIL_ID><suffix> volume — each potentially gigabytes of
+    persisted nested images — and a plain `down` (no -v) keeps them, so they pile
+    up as orphans. This reclaims them, the volume analog of prune_images. A volume
+    backing a live session is kept (docker refuses to remove an in-use volume) and
+    reported on its line. Nothing else uses the dind- prefix, so the base
+    jail-tmp/squid-logs/dns-logs volumes are never touched.
+    """
+    try:
+        listed = subprocess.run(
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True)
+    except OSError:
+        die("docker not found on PATH")
+    if listed.returncode != 0:
+        die("could not list docker volumes to prune")
+    names = sorted({v for v in listed.stdout.split() if _DIND_VOLUME.match(v)})
+    if not names:
+        print("No claude-jail dind volumes to prune.")
+        return 0
+    print(f"Pruning {len(names)} claude-jail dind volume(s): {', '.join(names)}")
+    return subprocess.run(["docker", "volume", "rm", *names]).returncode
 
 
 # `docker compose` global flags that consume the following token as their value;
@@ -627,8 +699,123 @@ def ensure_user_config(home: Path, jail_user: str) -> None:
         die(f"could not create the per-user config in {home}: {e}")
 
 
+def jail_image(name: str, environment: "dict") -> str:
+    """`name` suffix-scoped to this run's build inputs (JAIL_IMAGE_SUFFIX).
+
+    The launcher's single source of truth for image refs: the base `claude-jail`
+    and the derived `claude-jail-dind` both content-address the packages + uid/gid
+    via the same suffix, matching docker-compose's `image: claude-jail${...}` and
+    the dind overlay's `image: claude-jail-dind${...}`. Keeping the rule here (not
+    re-spelled at each call site) stops the base ref and the tag drifting apart.
+    """
+    return name + environment.get("JAIL_IMAGE_SUFFIX", "")
+
+
+def dind_image(environment: "dict") -> str:
+    """The dind image ref for this run, suffix-scoped to match its prod base.
+
+    The prod base is claude-jail<suffix>, where the suffix content-addresses the
+    packages and uid/gid; the dind image derives FROM that base, so it must carry
+    the SAME suffix. A fixed `claude-jail-dind:latest` would let a config with
+    different packages or uid/gid silently reuse another config's image — running
+    the wrong toolchain and wrong baked uid/gid — since ensure_dind_image's
+    presence check keys on this ref. Matches the base's own suffix scoping.
+    """
+    return jail_image("claude-jail-dind", environment)
+
+
+def build_dind_image(base_image: str, tag: str,
+                     build_flags: "list[str]" = ()) -> int:
+    """`docker buildx build` the dind image (tag) FROM the given prod base tag.
+
+    Used for `claude-jail --dind build`, after a normal compose build has produced
+    the prod base (claude-jail<suffix>). The FROM is that local base, so the build
+    must run on the `docker`-driver builder — the one bound to the daemon's image
+    store, which can resolve a local FROM. `--builder default` pins it explicitly:
+    a bare `docker build` uses whatever builder the operator has *selected* (e.g. a
+    `docker buildx create --use` container/remote driver has its own store and
+    can't see the local base — it would turn the FROM into a spurious registry
+    pull, `pull access denied ... claude-jail<suffix>`, the very failure this path
+    exists to avoid). The docker driver also auto-loads the result into the local
+    store, so ensure_dind_image's `docker image inspect` finds it — no `--load`.
+    `--pull` is deliberately dropped from build_flags: a pull would likewise try
+    (and fail) to fetch the local base from a registry. Returns the exit status.
+    """
+    dind_flags = [f for f in build_flags if f != "--pull"]
+    return subprocess.run(
+        ["docker", "buildx", "build", "--builder", "default", *dind_flags,
+         "--build-arg", f"BASE_IMAGE={base_image}",
+         "-t", tag, "-f", str(DIND_DOCKERFILE),
+         str(SCRIPT_DIR)]).returncode
+
+
+def dind_build_stack(environment: "dict", build_flags: "list[str]" = ()) -> int:
+    """Build the prod base (the `claude` service) then the dind image; return status.
+
+    The compose build produces claude-jail<suffix> (with the run's real build args);
+    build_dind_image() then layers the dind image on top. Shared by the `build`
+    command and the on-demand build a `--dind` launch does when the image is
+    missing. Only the `claude` service is built — all the dind FROM needs — leaving
+    the launch's own `run` to build the squid/dns/ide side images when it starts
+    them, so neither the `--dind build` path nor the launch hot path drags a
+    full-graph (re)build (and, under --no-cache, a from-scratch squid/unbound
+    rebuild) it doesn't consume. build_flags — the validated --no-cache/--pull —
+    flow to the compose build; the dind docker build takes --no-cache but not --pull
+    (its FROM is the local base). Routed through run_compose (override="") so every
+    compose invocation shares one chokepoint.
+    """
+    status = run_compose(_base_compose_cmd(), ["build", *build_flags, "claude"], "")
+    if status == 0:
+        status = build_dind_image(jail_image("claude-jail", environment),
+                                  dind_image(environment), build_flags)
+    return status
+
+
+def _image_present(ref: str) -> bool:
+    """True when `docker image inspect ref` finds the image in the local store."""
+    return subprocess.run(["docker", "image", "inspect", ref],
+                          capture_output=True).returncode == 0
+
+
+def ensure_dind_image(environment: "dict") -> None:
+    """Build the dind image on demand before a `--dind` launch, if it's absent.
+
+    So a bare `claude-jail --dind run` builds the image the first time (or after a
+    `docker image rm`) and reuses it after, with no separate build step. Force a
+    rebuild — e.g. after editing the image — with an explicit `--dind build`.
+
+    Builds only what is actually missing: the prod base is (re)built via compose
+    only when absent, so a first `--dind run` after a plain `claude-jail build`
+    skips straight to the cheap `docker buildx build` dind layer instead of a
+    redundant base rebuild. (The explicit `--dind build` still rebuilds both, via
+    dind_build_stack — that path is for forcing a refresh.)
+    """
+    if _image_present(dind_image(environment)):
+        return
+    print("claude-jail: building the claude-jail-dind image (first --dind run)…",
+          file=sys.stderr)
+    base = jail_image("claude-jail", environment)
+    if not _image_present(base) and run_compose(
+            _base_compose_cmd(), ["build", "claude"], "") != 0:
+        die("failed to build the prod base for the claude-jail-dind image; build "
+            "it explicitly with `claude-jail --dind build` to see the error")
+    if build_dind_image(base, dind_image(environment)) != 0:
+        die("failed to build the claude-jail-dind image; build it explicitly with "
+            "`claude-jail --dind build` to see the error")
+
+
 def main() -> None:
     args = parse_args(sys.argv[1:])
+    # --dind only means anything for a command that builds or launches the jail
+    # container. Reject it up front for anything outside the allow-list — prune
+    # (host-wide image GC), the review family (host-side bundle ops) and the raw
+    # `compose` hatch all short-circuit below before any --dind handling and would
+    # otherwise silently drop the flag. One fail-closed guard, so a command added
+    # to KNOWN_COMMANDS later can't accidentally inherit --dind's build/launch path.
+    if args.dind and args.command not in _DIND_COMMANDS:
+        die(f"--dind does not apply to `{args.command}`: it neither builds nor "
+            "launches the dind image (only run/new/build/down/logs/ps do). Drop "
+            "--dind for this command.")
     # prune is host-wide image cleanup that drives the bare `docker` CLI, not
     # compose, and is anchored on no config: short-circuit before
     # require_docker_compose() and any config/prompt work so it runs from
@@ -636,7 +823,12 @@ def main() -> None:
     if args.command == "prune":
         if args.command_args:
             die("prune accepts no arguments")
-        sys.exit(prune_images())
+        # Reclaim both the orphaned package images and the orphaned dind
+        # data-root volumes; run both even if the first reports a failure, and
+        # surface a non-zero status if either did.
+        image_rc = prune_images()
+        volume_rc = prune_volumes()
+        sys.exit(image_rc or volume_rc)
     # The config the run is anchored on: an explicit -c, else .claude-jail.json in
     # the cwd. Computed once here for every command past prune — review's
     # short-circuit and the launch path below both read it.
@@ -674,6 +866,11 @@ def main() -> None:
     if review_ctx and args.command == "compose":
         die("review isolation is not supported via the raw `compose` escape hatch; "
             "use the strict run/new commands")
+    # (`--dind compose` is already rejected by the _DIND_COMMANDS allow-list at the
+    # top of main(): the raw hatch's verbatim args bypass the overlay merge, and a
+    # hatch that builds would hand `docker compose` the dind image's local
+    # `FROM claude-jail<suffix>`, the very build the dedicated `docker build` path
+    # exists to avoid.)
     # The opt-in IDE bridge is wholly owned by the `ide` package: its env
     # additions point the in-jail CLI at the relay; everything else (the host
     # helper, the lockfile mirror dir) lives behind start()/stop() below.
@@ -687,6 +884,20 @@ def main() -> None:
     # same defensive pin as COMPOSE_PROFILES) so a value inherited from the shell
     # can't silently suppress the continue on a normal run.
     environment["CLAUDE_JAIL_NEW_SESSION"] = "1" if args.command == "new" else ""
+    # Test seam (e2e): forward a scripted stand-in for the agent binary only when
+    # CLAUDE_JAIL_E2E is exactly "1", and pin both to "" otherwise — a defensive
+    # pin in the spirit of JAIL_REVIEW/COMPOSE_PROFILES, so a stray
+    # CLAUDE_JAIL_AGENT_CMD in a normal run's environment can never swap out what
+    # runs as claude. The gate is `== "1"`, not bare truthiness, so a
+    # CLAUDE_JAIL_E2E=0 (or "false") inherited from the shell reads as off. The
+    # gate is forwarded into the container alongside the command, so the prod
+    # entrypoint re-checks it (defence in depth): even a CLAUDE_JAIL_AGENT_CMD that
+    # reaches the image by some other path than this launcher stays inert without
+    # CLAUDE_JAIL_E2E=1 present too.
+    e2e = os.environ.get("CLAUDE_JAIL_E2E") == "1"
+    environment["CLAUDE_JAIL_E2E"] = "1" if e2e else ""
+    environment["CLAUDE_JAIL_AGENT_CMD"] = (
+        os.environ.get("CLAUDE_JAIL_AGENT_CMD", "") if e2e else "")
     if args.ide:
         environment.update(ide.environment())
 
@@ -699,7 +910,22 @@ def main() -> None:
         # an unintended IDE host — the mirror of COMPOSE_PROFILES being pinned.
         os.environ.pop("CLAUDE_CODE_IDE_HOST_OVERRIDE", None)
 
-    base_cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
+    # `--dind build` is its own path: build the prod base (compose) then the dind
+    # image (docker build). It doesn't launch, so it short-circuits the compose/
+    # mount machinery below, and never adds the overlay (which would make compose
+    # try to build the dind image via a builder that can't resolve its FROM).
+    if args.dind and args.command == "build":
+        # command_args holds the --no-cache/--pull already validated by
+        # resolve_command; forward them so `--dind build --no-cache` actually
+        # busts the cache instead of silently doing a cached build.
+        sys.exit(dind_build_stack(environment, args.command_args))
+
+    base_cmd = _base_compose_cmd()
+    if args.dind:
+        # A second `-f`: compose deep-merges it onto the `claude` service (image +
+        # privilege) while keeping everything else, and run_compose still appends
+        # the mount override last, so review isolation wins over both.
+        base_cmd += ["-f", str(DIND_OVERRIDE)]
     # Only a command that actually launches the jail container needs the host
     # state the mounts consume — and the mount override itself.
     ide_mirror = None
@@ -708,6 +934,19 @@ def main() -> None:
         if not base:
             die("no config store location: $HOME is not set; add a "
                 '"claude_dir_base" key to the config or pass --claude-dir-base')
+        if args.dind:
+            # The rootless daemon in the dind image runs as the container's
+            # `claude` user and refuses to start as root, so a uid-0 config makes
+            # `--dind` unusable. Fail with a clear message rather than let dockerd
+            # abort opaquely mid-startup. (A uid:0 config is only for the throwaway
+            # repo *inside* a --dind session — see docker/claude-jail-dind/README.)
+            if environment["JAIL_UID"] == "0":
+                die("--dind can't run as uid 0: the rootless Docker daemon refuses "
+                    "to run as root; use a non-zero uid for the --dind session.")
+            # Build the dind image on demand, so a bare `claude-jail --dind run`
+            # just works the first time. After the store-base check above, so an
+            # unset $HOME aborts before an expensive build rather than after it.
+            ensure_dind_image(environment)
         ensure_user_config(Path(base), environment["JAIL_USER"])
         if override:
             build_mounts.ensure_empty_mask()

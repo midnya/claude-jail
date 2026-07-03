@@ -1,0 +1,58 @@
+# Overlay for `claude-jail --dind`. Merged OVER docker-compose.yml by the launcher
+# (which inserts it as a second `-f`, before the mount override), so the WHOLE
+# `claude` service is reused — its internal network, squid/dns depends_on, proxy +
+# review environment, the .claude store binds, working_dir, everything — and only
+# the dind bits are layered on: the claude-jail-dind image (prod image + rootless
+# Docker), the privilege a nested daemon needs, and a persistent store for the
+# images that daemon builds.
+#
+# The image runs claude via the normal entrypoint (its CMD is
+# claude-jail-entrypoint), just with dockerd brought up first — so review /
+# permission-mode / --continue all behave exactly as a normal run.
+services:
+  claude:
+    # Suffix-scoped to match the prod base (claude-jail${JAIL_IMAGE_SUFFIX}) this
+    # image derives FROM, so two configs with different packages/uid-gid don't
+    # share one dind image. The launcher builds/inspects the same ref.
+    image: claude-jail-dind${JAIL_IMAGE_SUFFIX:-}
+    # This build: block is a REQUIRED override, not deletable dead code: it must
+    # shadow the base service's build: (docker/claude/Dockerfile). The launcher
+    # normally prebuilds the image itself (`docker buildx build`, which resolves
+    # the local `FROM claude-jail<suffix>`) and never asks compose to build it, so
+    # this rarely fires — but if it were dropped, the merged service would inherit
+    # the base's PROD build and an accidental `compose build` would produce the
+    # prod image mislabelled as the dind tag. context stays `.` (from the base);
+    # just swap the Dockerfile, and pass the suffix-scoped base explicitly so it
+    # derives FROM the matching base, not the Dockerfile's default
+    # `claude-jail:latest` (wrong toolchain/uid for a non-default config, or absent).
+    build:
+      dockerfile: docker/claude-jail-dind/Dockerfile
+      args:
+        BASE_IMAGE: claude-jail${JAIL_IMAGE_SUFFIX:-}
+    # privileged already grants /dev/fuse (and every other host device) via an
+    # unrestricted device cgroup, so no explicit `devices:` entry is needed.
+    privileged: true
+    volumes:
+      # The nested daemon's image store — a named volume so what it builds on the
+      # first nested `run` persists across runs and stays off the overlay rootfs.
+      # Merged onto (not replacing) the base service's volumes.
+      - dind-data:/home/claude/.local/share/docker
+
+volumes:
+  dind-data:
+    # Scoped by JAIL_ID (the full config realpath) like every base volume, NOT the
+    # default COMPOSE_PROJECT_NAME (dir basename): two projects sharing a basename
+    # under different paths must not share one nested-daemon image store. The image
+    # suffix is folded in too (JAIL_IMAGE_SUFFIX content-addresses the packages +
+    # uid/gid): the rootless data-root is owned by the container uid, so a config
+    # that later changes its uid/gid gets a fresh store instead of a new-uid
+    # dockerd inheriting — and failing on — a graphdir owned by the old uid.
+    #
+    # CONCURRENCY CAVEAT: unlike the base jail (whose same-config runs safely share
+    # squid/network/jail-tmp), two concurrent --dind runs of the SAME config resolve
+    # to this one volume — and a rootless dockerd takes an EXCLUSIVE lock on its
+    # data-root, so the second session's daemon can't start and times out in the
+    # entrypoint's readiness wait. Concurrent same-config --dind sessions are not
+    # supported; a persistent per-session store isn't possible (it defeats the
+    # image-cache reuse this volume exists for). Run them sequentially.
+    name: claude-jail-dind-${JAIL_ID}${JAIL_IMAGE_SUFFIX:-}

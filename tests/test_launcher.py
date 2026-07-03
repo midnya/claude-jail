@@ -404,6 +404,21 @@ class PruneImagesTests(JailTestCase):
                          ["claude-jail-0badf00d", "claude-jail-deadbeef"])
         self.assertEqual(rc, 0)
 
+    def test_dind_variants_removed_children_first(self):
+        # The suffixed dind image is a package variant too (removed), while the
+        # bare claude-jail/claude-jail-dind singletons are left alone. A dind image
+        # derives FROM its like-suffixed base, so it must be listed (and removed)
+        # before that base, or `docker image rm` refuses the base for having a
+        # dependent child — the sort key puts every `-dind-` ref first.
+        rc, rm = self._prune([
+            "claude-jail", "claude-jail-dind",
+            "claude-jail-deadbeef", "claude-jail-dind-deadbeef",
+        ])
+        self.assertEqual(len(rm), 1)
+        self.assertEqual(rm[0][3:],
+                         ["claude-jail-dind-deadbeef", "claude-jail-deadbeef"])
+        self.assertEqual(rc, 0)
+
     def test_noop_when_nothing_matches(self):
         rc, rm = self._prune(["claude-jail", "claude-jail-squid", "node"])
         self.assertEqual(rm, [])  # never invokes `docker image rm`
@@ -438,6 +453,58 @@ class PruneImagesTests(JailTestCase):
         with mock.patch.object(L.subprocess, "run", side_effect=OSError):
             with self.assertDies("docker not found"):
                 L.prune_images()
+
+
+class PruneVolumesTests(JailTestCase):
+    def _prune(self, volumes, rm_returncode=0):
+        """Run prune_volumes() against a fake `docker volume ls` listing."""
+        calls = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(cmd)
+            if cmd[:3] == ["docker", "volume", "ls"]:
+                return mock.Mock(returncode=0, stdout="\n".join(volumes) + "\n")
+            return mock.Mock(returncode=rm_returncode)
+
+        with mock.patch.object(L.subprocess, "run", side_effect=fake_run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = L.prune_volumes()
+        rm = [c for c in calls if c[:3] == ["docker", "volume", "rm"]]
+        return rc, rm
+
+    def test_removes_only_dind_data_volumes(self):
+        # Only the claude-jail-dind-<...> data-root volumes are removed; the base
+        # jail-tmp/squid-logs/dns-logs volumes (and anything else) are left alone.
+        rc, rm = self._prune([
+            "claude-jail-tmp-home-me-proj",
+            "claude-jail-squid-logs-home-me-proj-abc1",
+            "claude-jail-dns-logs-home-me-proj-abc1",
+            "some-other-volume",
+            "claude-jail-dind-home-me-proj",
+            "claude-jail-dind-home-me-proj-deadbeef",
+        ])
+        self.assertEqual(len(rm), 1)
+        self.assertEqual(rm[0][3:],
+                         ["claude-jail-dind-home-me-proj",
+                          "claude-jail-dind-home-me-proj-deadbeef"])
+        self.assertEqual(rc, 0)
+
+    def test_noop_when_nothing_matches(self):
+        rc, rm = self._prune(["claude-jail-tmp-x", "claude-jail-squid-logs-y"])
+        self.assertEqual(rm, [])  # never invokes `docker volume rm`
+        self.assertEqual(rc, 0)
+
+    def test_propagates_rm_failure(self):
+        # A volume backing a live session is kept (docker rm fails); rc surfaces it.
+        rc, rm = self._prune(["claude-jail-dind-proj"], rm_returncode=1)
+        self.assertEqual(len(rm), 1)
+        self.assertEqual(rc, 1)
+
+    def test_dies_when_listing_fails(self):
+        with mock.patch.object(L.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout="")):
+            with self.assertDies("could not list"):
+                L.prune_volumes()
 
 
 class RunComposeTests(JailTestCase):
@@ -483,12 +550,13 @@ class MainEnvSignalTests(JailTestCase):
     point run_compose would hand it to `docker compose run`.
     """
 
-    def _run_main(self, argv, preset=None):
+    def _run_main(self, argv, preset=None, env_overrides=None, expect_die=None):
         captured = {}
 
         def fake_run_compose(base_cmd, compose_args, override):
             captured["new_session"] = L.os.environ.get("CLAUDE_JAIL_NEW_SESSION")
             captured["profiles"] = L.os.environ.get("COMPOSE_PROFILES")
+            captured["base_cmd"] = list(base_cmd)
             return 0
 
         # The few env keys main() reads back out of build_jail's result.
@@ -496,7 +564,10 @@ class MainEnvSignalTests(JailTestCase):
             "JAIL_CLAUDE_DIR_BASE": "/x",
             "JAIL_USER": "me",
             "COMPOSE_PROJECT_NAME": "proj",
+            "JAIL_UID": "1000",
         }
+        if env_overrides:
+            fake_env.update(env_overrides)
         with contextlib.ExitStack() as stack:
             # patch.dict restores os.environ (incl. the keys main() adds) on exit.
             stack.enter_context(mock.patch.dict(L.os.environ, clear=False))
@@ -513,10 +584,89 @@ class MainEnvSignalTests(JailTestCase):
             stack.enter_context(mock.patch.object(L, "cleanup_side_containers"))
             stack.enter_context(
                 mock.patch.object(L, "run_compose", side_effect=fake_run_compose))
+            # Stub the docker-touching dind builders so --dind paths don't shell
+            # out; record that they fired.
+            stack.enter_context(mock.patch.object(
+                L, "ensure_dind_image",
+                side_effect=lambda env: captured.__setitem__("ensure_dind", True)))
+            stack.enter_context(mock.patch.object(
+                L, "dind_build_stack",
+                side_effect=lambda env, flags=(): (
+                    captured.__setitem__("dind_build", True)
+                    or captured.__setitem__("dind_build_flags", list(flags))
+                    or 0)))
             with self.assertRaises(SystemExit) as cm:
                 L.main()
-        self.assertEqual(cm.exception.code, 0)
+        if expect_die is not None:
+            message = str(cm.exception.code)
+            self.assertTrue(message.startswith("Error:"),
+                            f"expected a die() message, got {message!r}")
+            for needle in expect_die:
+                self.assertIn(needle, message)
+        else:
+            self.assertEqual(cm.exception.code, 0)
         return captured
+
+    def test_dind_run_adds_overlay_and_builds_on_demand(self):
+        # --dind run inserts the overlay as a second -f, after the base compose
+        # file and before run_compose appends the mount override — so it merges
+        # onto the real `claude` service — and ensures the image is built first.
+        captured = self._run_main(["--dind", "run"])
+        base_cmd = captured["base_cmd"]
+        self.assertEqual(base_cmd[:4],
+                         ["docker", "compose", "-f", str(L.COMPOSE_FILE)])
+        self.assertEqual(base_cmd[-2:], ["-f", str(L.DIND_OVERRIDE)])
+        self.assertTrue(captured.get("ensure_dind"))
+
+    def test_no_dind_omits_override_and_build(self):
+        # A normal run never mentions the overlay or the dind build: prod
+        # behaviour is untouched.
+        captured = self._run_main(["run"])
+        self.assertNotIn(str(L.DIND_OVERRIDE), captured["base_cmd"])
+        self.assertNotIn("ensure_dind", captured)
+
+    def test_dind_run_rejects_root_uid(self):
+        # The rootless daemon in the dind image refuses to run as root, so a uid-0
+        # config makes --dind unusable: die with a clear message before the
+        # on-demand build rather than let dockerd abort opaquely at startup.
+        captured = self._run_main(["--dind", "run"], env_overrides={"JAIL_UID": "0"},
+                                  expect_die=["--dind", "uid 0"])
+        # Died before the on-demand build fired.
+        self.assertNotIn("ensure_dind", captured)
+
+    def test_dind_build_builds_dind_image(self):
+        # --dind build is its own path: it builds the dind stack and never reaches
+        # run_compose (no base_cmd captured), so the overlay's unbuildable FROM is
+        # never handed to `docker compose build`.
+        captured = self._run_main(["--dind", "build"])
+        self.assertTrue(captured.get("dind_build"))
+        self.assertNotIn("base_cmd", captured)
+
+    def test_dind_build_forwards_build_flags(self):
+        # The --no-cache/--pull that resolve_command validated must reach
+        # dind_build_stack, not be silently dropped by the short-circuit.
+        captured = self._run_main(["--dind", "build", "--no-cache"])
+        self.assertEqual(captured.get("dind_build_flags"), ["--no-cache"])
+
+    def test_dind_rejected_for_non_dind_command(self):
+        # --dind is fail-closed to the run/new/build/down/logs/ps allow-list: a
+        # host-side command (prune / the review family) or the raw compose hatch
+        # is rejected up front, never silently stripped of the flag — and dies
+        # before any build or launch machinery runs.
+        for command in ("prune", "accept", "compose"):
+            captured = self._run_main(["--dind", command],
+                                      expect_die=["--dind", command])
+            self.assertNotIn("base_cmd", captured)
+            self.assertNotIn("ensure_dind", captured)
+            self.assertNotIn("dind_build", captured)
+
+    def test_dind_read_only_command_adds_overlay_without_build(self):
+        # logs/ps/down are on the allow-list but don't launch: the overlay is
+        # layered (so the dind service is what's inspected/torn down), yet no
+        # on-demand build fires.
+        captured = self._run_main(["--dind", "logs"])
+        self.assertEqual(captured["base_cmd"][-2:], ["-f", str(L.DIND_OVERRIDE)])
+        self.assertNotIn("ensure_dind", captured)
 
     def test_new_sets_session_signal(self):
         self.assertEqual(self._run_main(["new"])["new_session"], "1")

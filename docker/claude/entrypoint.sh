@@ -31,6 +31,20 @@ if [ -n "${CLAUDE_JAIL_PERMISSION_MODE:-}" ]; then
     [ "$caller_set_mode" = 0 ] && args+=(--permission-mode "$CLAUDE_JAIL_PERMISSION_MODE")
 fi
 
+# Which binary runs as the agent. Always the real `claude`, unless the e2e harness
+# is explicitly armed: CLAUDE_JAIL_AGENT_CMD (a scripted stand-in, so a review
+# round-trip can be driven deterministically) is honoured ONLY when CLAUDE_JAIL_E2E
+# is exactly "1". The launcher pins both off on a normal run and forwards them
+# together under e2e; re-checking the gate here — not just in the launcher — means
+# a CLAUDE_JAIL_AGENT_CMD that reaches this image by any other path (a hand-rolled
+# `docker compose run`, CI) still can't swap out what runs as claude. A single
+# executable word (the e2e agent is one script), not a command line, so the
+# invocations below stay a plain call.
+agent=claude
+if [ "${CLAUDE_JAIL_E2E:-}" = "1" ] && [ -n "${CLAUDE_JAIL_AGENT_CMD:-}" ]; then
+    agent="$CLAUDE_JAIL_AGENT_CMD"
+fi
+
 # git-review isolation: attach the throwaway .git to the live working tree
 # before the session, then bundle the session's commits to the spool after it.
 # Can't exec here — the export has to run once claude exits — so run it inline and
@@ -82,7 +96,7 @@ if [ -n "${JAIL_REVIEW:-}" ]; then
     # (`<&3`) so fd 0 stays the container's stdin; `exec claude` above needs no
     # such care because exec keeps the shell's own descriptors.
     exec 3<&0
-    claude "${args[@]}" "$@" <&3 &
+    "$agent" "${args[@]}" "$@" <&3 &
     review_child=$!
     # `wait` returns >128 when a trapped signal interrupts it *before* claude has
     # exited; review_forward relayed the signal, so wait again until claude is
@@ -107,4 +121,4 @@ if [ -n "${JAIL_REVIEW:-}" ]; then
     exit "$status"
 fi
 
-exec claude "${args[@]}" "$@"
+exec "$agent" "${args[@]}" "$@"

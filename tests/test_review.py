@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -30,6 +31,14 @@ _GIT_ENV = {
     # never drop into an editor for a merge commit message (apply's divergent path)
     "GIT_MERGE_AUTOEDIT": "no",
 }
+
+# Exactly the SGR codes _colorize emits (review._C_*): reset, bold, red, green,
+# yellow, cyan. Stripping ONLY these — not any SGR — is what lets the security
+# tests below prove "only our own colour": a foreign SGR that slipped through
+# _sanitize (a different code, or 256-colour `38;5;n`) survives into `leftover`
+# and trips the assertion, instead of being erased as if it were ours.
+_OUR_SGR = r"\x1b\[(?:0|1|31|32|33|36)m"
+_OUR_SGR_B = rb"\x1b\[(?:0|1|31|32|33|36)m"
 
 
 class ReviewBase(JailTestCase):
@@ -841,9 +850,11 @@ class DispatchTests(ReviewBase):
         self.assertNotIn("diff --git", out)
 
     def test_review_detail_never_emits_escapes(self):
-        # The colour path was removed: review_detail runs git --color=never and
-        # carries no escape sequences, so _page never has to trust SGR through a
-        # pager (which a control-byte-split CSI could defeat).
+        # review_detail runs git --color=never and adds no colour itself, so its
+        # output carries no escape sequences: colour is (re)generated only later,
+        # in _page, over text _sanitize has already scrubbed. Keeping the producer
+        # escape-free is what lets _page trust that the only SGR it emits are its
+        # own (a control-byte-split CSI could otherwise defeat a pass-through).
         repo, base, cfg, store = self.make_repo()
         self.import_feature(repo, base)
         self.assertNotIn("\x1b", review.review_detail(repo, "b", None))
@@ -883,6 +894,7 @@ class DispatchTests(ReviewBase):
         self.assertEqual(len(calls), 1)
         args, kw = calls[0]
         self.assertEqual(args[0], "less")            # pinned, not shelled out
+        self.assertIn("-R", args)                    # renders our own SGR colour
         self.assertNotIn("evil-pager", args)
         self.assertEqual(kw["env"]["LESS"], "")      # inherited LESS=-r neutralised
         self.assertEqual(kw["env"]["LESSSECURE"], "1")
@@ -1185,16 +1197,240 @@ class PageSanitizeTests(ReviewBase):
         self.assertEqual(out, b"ab31mcd\te\n")
 
     def test_pager_path_strips_control_split_csi(self):
-        # Regression for the removed colour path: it reassembled a control-byte-
-        # split CSI (e.g. ESC '[' DEL '2' 'J') into a live clear-screen escape once
-        # the wedged byte was stripped, past `less -R`. _page now fully sanitises
-        # on the paginated path too, so the bytes handed to the pager carry no ESC.
+        # Regression for the control-byte-split CSI (e.g. ESC '[' DEL '2' 'J'): the
+        # old pass-through colour path let it reassemble into a live clear-screen
+        # escape once the wedged byte was stripped, past `less -R`. _page now
+        # sanitises BEFORE it re-colours, so the split escape is inert text by the
+        # time colour is added — the ONLY escapes the pager sees are our own SGR.
         captured = {}
         with mock.patch.object(review.subprocess, "run",
                                lambda args, **kw: captured.update(kw)):
             review._page("a\x1b[\x7f2J\x1b[\x081Hb\n", True)   # two split escapes
-        self.assertNotIn(b"\x1b", captured["input"])   # no escape reaches the pager
-        self.assertIn(b"a", captured["input"])         # visible text still does
+        inp = captured["input"]
+        leftover = re.sub(_OUR_SGR_B, b"", inp)  # drop our own SGR colour, nothing else
+        self.assertNotIn(b"\x1b", leftover)      # no attacker escape reaches the pager
+        self.assertIn(b"a", inp)                 # visible text still does
+        self.assertIn(b"2J", inp)                # the split CSI is now inert plain text
+
+
+class ColorizeTests(ReviewBase):
+    """Host-side re-colouring: colour is regenerated from the diff's structure,
+    over already-sanitised text, so no escape is ever carried through from git."""
+
+    # SGR the colouriser emits, keyed by git's diff palette (see review._C_*).
+    GREEN, RED, CYAN, BOLD, YELLOW = "\x1b[32m", "\x1b[31m", "\x1b[36m", "\x1b[1m", "\x1b[33m"
+
+    def test_colours_follow_git_diff_defaults(self):
+        text = ("abc1234 subject line\n"
+                "diff --git a/f b/f\n"
+                "index 111..222 100644\n"
+                "--- a/f\n"
+                "+++ b/f\n"
+                "@@ -1,2 +1,2 @@ def region():\n"
+                " context stays plain\n"
+                "-removed\n"
+                "+added\n")
+        out = review._colorize(text)
+        self.assertIn(self.YELLOW + "abc1234" + "\x1b[0m subject", out)  # sha only
+        self.assertIn(self.BOLD + "diff --git a/f b/f", out)            # meta header
+        self.assertIn(self.BOLD + "--- a/f", out)                       # old-file header
+        self.assertIn(self.BOLD + "+++ b/f", out)                       # new-file header
+        self.assertIn(self.CYAN + "@@ -1,2 +1,2 @@\x1b[0m def region():", out)  # frag + heading plain
+        self.assertIn(self.RED + "-removed", out)                       # removal
+        self.assertIn(self.GREEN + "+added", out)                       # addition
+        self.assertIn("\n context stays plain\n", out)                  # context uncoloured
+
+    def test_colorize_is_purely_additive(self):
+        # Stripping the SGR codes back out must reproduce the input byte for byte:
+        # colour changes presentation only, never the reviewed text.
+        text = ("diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n context\n"
+                "\\ No newline at end of file\n")
+        out = review._colorize(text)
+        self.assertNotEqual(out, text)                       # colour was added
+        self.assertEqual(re.sub(_OUR_SGR, "", out), text)    # ...and only our colour
+
+    def test_hunk_body_markers_win_over_file_headers(self):
+        # A removed line whose content is literally "--- x" (rendered "----- x"?) or
+        # an added "+++ y" must colour as removal/addition, NOT as a file header:
+        # in-hunk state is checked before the meta patterns.
+        text = "@@ -1 +1 @@\n---three dashes\n+++three pluses\n"
+        out = review._colorize(text)
+        self.assertIn(self.RED + "---three dashes", out)     # removal, not meta
+        self.assertIn(self.GREEN + "+++three pluses", out)   # addition, not meta
+
+    def test_context_and_unknown_lines_stay_uncoloured(self):
+        text = "Bundle: b\nplain summary line\n"
+        self.assertEqual(review._colorize(text), text)       # nothing to colour
+
+    def test_hazard_lines_are_yellow(self):
+        # The indented `[!]` hazard/rewrite notes review_overview/review_detail emit
+        # start with `[!]` after their leading whitespace, and are tinted yellow.
+        text = "  [!] rewrites history\n    [!] force-push detected\n"
+        out = review._colorize(text)
+        self.assertIn(self.YELLOW + "  [!] rewrites history", out)
+        self.assertIn(self.YELLOW + "    [!] force-push detected", out)
+
+    def test_bare_or_padded_hex_is_not_mistaken_for_a_sha(self):
+        # _COMMIT_RE only tints a hex run FOLLOWED by ` <subject>` (a real
+        # log --oneline row). A bare hex token, or a hex-looking bundle name padded
+        # with two spaces before a `[!]` note, has no such subject and stays plain.
+        self.assertIn(self.YELLOW + "abc1234" + "\x1b[0m subj",
+                      review._colorize("abc1234 subj\n"))          # real log row: tinted
+        self.assertNotIn("\x1b", review._colorize("deadbeef\n"))   # bare name: plain
+        self.assertNotIn("\x1b", review._colorize("deadbeef  [!] rewrites\n"))
+
+    def test_rangediff_commit_rows_tint_shas_body_stays_plain(self):
+        # A `git range-diff` commit-pair row has both abbreviated shas tinted (like
+        # a log row); the nested diff-of-diffs body under it is left uncoloured, and
+        # a `-:  -------` placeholder (a one-sided commit) is not tinted as a sha.
+        text = ("1:  0ca9519 ! 1:  559b0a5 change on main\n"
+                "    @@ f.txt\n"
+                "     -b\n"
+                "    -+B\n"
+                "    ++B2\n"
+                "-:  ------- > 2:  abcdef0 only on the right\n")
+        out = review._colorize(text)
+        self.assertIn(self.YELLOW + "0ca9519" + "\x1b[0m ! ", out)     # left sha
+        self.assertIn(self.YELLOW + "559b0a5" + "\x1b[0m change", out) # right sha
+        self.assertIn(self.YELLOW + "abcdef0" + "\x1b[0m only", out)   # one-sided sha
+        self.assertNotIn(self.YELLOW + "----", out)                   # placeholder plain
+        self.assertIn("\n    @@ f.txt\n", out)                        # inner hunk plain
+        self.assertIn("\n    -+B\n", out)                             # diff-of-diff plain
+        self.assertEqual(re.sub(_OUR_SGR, "", out), text)             # purely additive
+
+    def test_combined_diff_uses_the_hunk_header_column_count(self):
+        # A combined (merge) diff has one +/- column per parent; _colorize takes the
+        # column count from the `@@@` header, so a line added/removed in only the
+        # second parent (a space in column 1) still colours — not just column-1 marks.
+        text = ("@@@ -1,2 -1,2 +1,2 @@@\n"
+                "  context both\n"
+                " +added in one parent\n"
+                " -removed in one parent\n"
+                "++added in both\n")
+        out = review._colorize(text)
+        self.assertIn(self.GREEN + " +added in one parent", out)
+        self.assertIn(self.RED + " -removed in one parent", out)
+        self.assertIn(self.GREEN + "++added in both", out)
+        self.assertIn("\n  context both\n", out)             # both-space column = plain
+        self.assertEqual(re.sub(_OUR_SGR, "", out), text)    # purely additive
+
+    def test_prose_at_at_line_does_not_open_a_hunk(self):
+        # A non-diff line that merely starts with `@@` (no closing `@@`) must not
+        # enter hunk state: the following `+`/`-` prose stays plain, not diff-body.
+        text = "@@ just prose, no closing marker\n+not an addition\n-not a removal\n"
+        out = review._colorize(text)
+        self.assertNotIn(self.GREEN + "+not an addition", out)
+        self.assertNotIn(self.RED + "-not a removal", out)
+        self.assertEqual(re.sub(_OUR_SGR, "", out), text)    # additive; nothing miscoloured
+
+    def test_only_our_sgr_survives_a_hostile_diff(self):
+        # The core security property: given a maximally hostile diff, sanitise then
+        # colourise, and the ONLY escapes in the result are our own SGR codes — no
+        # cursor-move, clear, OSC, or C1 sequence derived from the untrusted bytes.
+        repo, base = self.init_repo()
+        ws = self.clone(repo)
+        payload = ("start\x1b[31mRED\x1b[0m\x1b[2J\x1b[H"      # SGR, clear, home
+                   "\x1b]0;title\x07"                          # OSC set-title
+                   "mid\x08\x08GOT\x7fend\n")                  # BS, DEL
+        self.write(Path(ws) / "evil.txt", payload)
+        self.git(ws, "add", "-A")
+        self.git(ws, "commit", "--no-gpg-sign", "-m",
+                 "subj \x1b[2J\x1b]0;x\x07 done")
+        review.import_bundle(repo, self.make_bundle(ws, [base]), "b")
+        coloured = review._colorize(review._sanitize(review.review_detail(repo, "b", None)))
+        leftover = re.sub(_OUR_SGR, "", coloured)            # remove ONLY our fixed SGR
+        self.assertNotIn("\x1b", leftover)                    # no foreign escape left
+        self.assertNotIn("\x9b", leftover)                    # nor an 8-bit C1 CSI
+        self.assertNotIn("\udc9b", leftover)                  # nor its surrogate form
+        self.assertIn("\x1b[32m", coloured)                   # our green WAS added
+        self.assertIn("start", coloured)                      # visible text preserved
+
+
+class PageColorTests(ReviewBase):
+    """_page adds colour for the terminal, but never when piped."""
+
+    _DIFF = ("diff --git a/f b/f\n@@ -0,0 +1 @@\n+hello\n")
+
+    def setUp(self):
+        super().setUp()
+        # Decouple the colour-positive assertions from the runner's environment: an
+        # ambient NO_COLOR would otherwise suppress the colour they check for. Saved
+        # and restored so a real NO_COLOR isn't clobbered for later tests.
+        self._saved_no_color = os.environ.pop("NO_COLOR", None)
+        self.addCleanup(self._restore_no_color)
+
+    def _restore_no_color(self):
+        if self._saved_no_color is not None:
+            os.environ["NO_COLOR"] = self._saved_no_color
+
+    def test_no_colour_when_piped(self):
+        # paginate=False is the piped case (stdout not a tty): no colour, like
+        # git's --color=auto. The bytes out must be exactly the sanitised text.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            review._page(self._DIFF, False)
+        self.assertNotIn("\x1b", buf.getvalue())
+        self.assertEqual(buf.getvalue(), review._sanitize(self._DIFF))  # exactly, unchanged
+
+    def test_less_missing_falls_back_to_coloured_text(self):
+        # When `less` is absent the paginate path can't page, so it writes the same
+        # post-scrub text straight out — still carrying the colour added above,
+        # since paginate implies a tty where our own SGR renders (see _page).
+        buf = io.StringIO()
+        with mock.patch.object(review.subprocess, "run", side_effect=OSError):
+            with contextlib.redirect_stdout(buf):
+                review._page(self._DIFF, True)
+        self.assertIn("\x1b[32m+hello", buf.getvalue())   # coloured, straight to stdout
+
+    def test_colour_added_on_paginate_path(self):
+        captured = {}
+        with mock.patch.object(review.subprocess, "run",
+                               lambda args, **kw: captured.update(kw)):
+            review._page(self._DIFF, True)
+        self.assertIn(b"\x1b[32m+hello", captured["input"])   # addition is green
+
+    def test_no_color_env_disables_colour(self):
+        # The NO_COLOR convention (no-color.org): a non-empty value suppresses it
+        # even on the paginate path.
+        os.environ["NO_COLOR"] = "1"
+        self.addCleanup(os.environ.pop, "NO_COLOR", None)
+        captured = {}
+        with mock.patch.object(review.subprocess, "run",
+                               lambda args, **kw: captured.update(kw)):
+            review._page(self._DIFF, True)
+        self.assertNotIn(b"\x1b", captured["input"])          # colour suppressed
+
+    def test_hostile_bundle_through_full_page_path_cannot_spoof(self):
+        # The end-to-end task: a REAL bundle whose file bytes AND commit message
+        # carry every terminal-spoofing primitive (SGR, screen-clear, cursor move,
+        # OSC title-set, a raw 8-bit C1 CSI, DEL, backspace), driven through the
+        # actual interactive _page path, must reach the pager carrying NO escape
+        # but our own SGR colour — the guarantee that review output can't spoof a
+        # terminal, made a permanent regression rather than a one-off check.
+        repo, base = self.init_repo()
+        ws = self.clone(repo)
+        # raw bytes (write_bytes, not write): a lone 0x9b exercises the
+        # surrogateescape -> U+DC9B strip path a str "\x9b" (2-byte UTF-8) wouldn't.
+        payload = (b"start\x1b[31mRED\x1b[0m\x1b[2J\x1b[H"   # SGR, clear, home
+                   b"\x1b]0;title\x07"                        # OSC set-title
+                   b"\x9b2J"                                   # raw 8-bit C1 CSI
+                   b"mid\x08\x08GOT\x7fend\n")                 # backspace, DEL
+        (Path(ws) / "evil.txt").write_bytes(payload)
+        self.git(ws, "add", "-A")
+        self.git(ws, "commit", "--no-gpg-sign", "-m", "subj \x1b[2J\x1b]0;x\x07 done")
+        review.import_bundle(repo, self.make_bundle(ws, [base]), "b")
+        detail = review.review_detail(repo, "b", None)        # carries raw escapes
+
+        captured = {}
+        with mock.patch.object(review.subprocess, "run",
+                               lambda args, **kw: captured.update(kw)):
+            review._page(detail, True)                        # the real tty path
+        out = captured["input"]                                # bytes handed to less -R
+        leftover = re.sub(_OUR_SGR_B, b"", out)               # strip ONLY our fixed SGR
+        self.assertNotIn(b"\x1b", leftover)                    # no foreign escape survives
+        self.assertNotIn(b"\x9b", leftover)                    # nor an 8-bit C1 CSI
+        self.assertIn(b"\x1b[32m", out)                        # our green colour WAS added
+        self.assertIn(b"start", out)                           # visible text preserved
 
 
 class SecondRoundRegressionTests(ReviewBase):

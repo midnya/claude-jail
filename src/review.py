@@ -813,8 +813,9 @@ def review_detail(repo: str, name: str, manifest: "dict | None") -> str:
     rewritten commits differ from the originals.
 
     Git is always run with --color=never: the diff content is untrusted and git
-    does not escape control sequences embedded in it, so colour is never trusted
-    through the pipe (see _page — the colour path was removed wholesale).
+    does not escape control sequences embedded in it, so no git-emitted colour is
+    ever trusted through the pipe. Colour is instead regenerated host-side, from
+    the scrubbed text's own structure, at display time (see _page / _colorize).
     """
     tint = "--color=never"
     report = analyze(repo, "unreviewed", name, manifest)
@@ -1281,8 +1282,9 @@ def _manifest_loader(spool: Path):
 # (ESC ] ... BEL or ST) and CSI sequences are matched whole; _CTRL_RE drops raw
 # control bytes — backspace, carriage return, vertical tab, the 0x80-0x9f C1
 # range (0x9b is an 8-bit CSI), DEL — that move the cursor or overwrite text on a
-# terminal, keeping only tab and newline. There is no colour-preserving variant:
-# _sanitize strips *every* escape (see _page on why the colour path was removed).
+# terminal, keeping only tab and newline. _sanitize strips *every* escape — no
+# git-emitted sequence is ever trusted as "just colour"; colour is instead
+# regenerated from scratch by _colorize, over text this has already scrubbed.
 _OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 # Full ECMA-48 CSI: parameter bytes 0x30-0x3F, intermediates 0x20-0x2F, final
 # 0x40-0x7E. The narrower [0-9;?] class missed ':' '<' '=' '>', letting some
@@ -1301,9 +1303,11 @@ def _sanitize(text: str) -> str:
     OSC strings, CSI/cursor/clear sequences, raw control bytes, and every stray
     ESC are all removed, so a hostile diff can neither move the cursor, clear the
     screen, nor overwrite what the reviewer reads. Nothing escapes — colour
-    included: there is deliberately no escape we trust to be "just colour", since
-    a control byte wedged inside an otherwise-SGR sequence could be reassembled
-    into a live cursor/clear escape once the byte is stripped (see _page).
+    included: there is deliberately no git escape we trust to be "just colour",
+    since a control byte wedged inside an otherwise-SGR sequence could be
+    reassembled into a live cursor/clear escape once the byte is stripped. Colour
+    is added back afterwards by _colorize, generated host-side from the structure
+    of this already-scrubbed text rather than carried through from git (see _page).
     """
     text = _OSC_RE.sub("", text)
     return _CTRL_RE.sub("", _CSI_RE.sub("", text).replace("\x1b", ""))
@@ -1331,39 +1335,167 @@ def _print(text: str = "") -> None:
     _write(_sanitize(text) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Host-side re-colouring
+#
+# git runs --color=never and _sanitize then strips every escape, so no colour
+# survives the pipe. We add it back here the safe way: _colorize re-derives the
+# colour from the diff's own structure and emits its OWN SGR codes over the
+# already-scrubbed (ESC-free) text — so every escape in the result is one of the
+# fixed codes below, never a byte that came from the untrusted diff. This is the
+# recolour-after-sanitising design the old _page TODO called for.
+# ---------------------------------------------------------------------------
+
+# git's default diff palette (cf. `git config color.diff.*`), as SGR parameters.
+_C_META = "1"        # bold — file headers (diff --git, index, ---/+++, mode, ...)
+_C_FRAG = "36"       # cyan — @@ hunk headers
+_C_OLD = "31"        # red — removed lines
+_C_NEW = "32"        # green — added lines
+# _C_COMMIT and _C_HAZARD are two independent roles that happen to share git's
+# yellow; kept as separate names so either can be re-themed without the other.
+_C_COMMIT = "33"     # yellow — abbreviated sha in `log --oneline` / range-diff rows
+_C_HAZARD = "33"     # yellow — a [!] hazard/rewrite note in the summary view
+_RESET = "\x1b[0m"
+
+# A line that opens a diff file section. Only tested when NOT inside a hunk body
+# (those lines are keyed off in_hunk first), so a removed line whose content is
+# literally "--- x", or an added "+++ y", is never mistaken for a file header.
+_DIFF_META_RE = re.compile(
+    r"(?:diff --git |diff --cc |diff --combined |index |--- |\+\+\+ |"
+    r"old mode |new mode |deleted file mode |new file mode |"
+    r"copy from |copy to |rename from |rename to |"
+    r"similarity index |dissimilarity index |Binary files )")
+# `git log --oneline` row: an abbreviated sha then a space and a non-empty
+# subject. The `(?= \S)` lookahead requires that subject, so a bare hex token, or
+# a hex-looking bundle name padded with two spaces before a `[!]` note (both of
+# which lack a ` <subject>` right after the hex), is not mistaken for a commit sha.
+_COMMIT_RE = re.compile(r"[0-9a-f]{7,40}(?= \S)")
+# @@ -a,b +c,d @@[ section heading]: colour through the closing @@ (frag) and
+# leave the trailing heading plain, as git does. `@@+` also matches a combined
+# diff's `@@@` header; its leading-@ count gives the +/- column count (_colorize).
+_HUNK_RE = re.compile(r"(@@+ .*? @@+)(.*)")
+# `git range-diff` commit-pair row: `<n>:  <sha> <op> <n>:  <sha> <subject>`,
+# where either side may be `-:  -------` when a commit is on only one side. The
+# two abbreviated shas (groups 3 and 7) get tinted; the nested diff-of-diffs body
+# under each row is left uncoloured — reproducing git's range-diff palette exactly
+# would need a fragile diff-of-a-diff parser, so we colour only the navigation.
+_RANGEDIFF_RE = re.compile(
+    r"(\d+|-)(:\s+)([0-9a-f]{7,40}|-+)(\s+[=<>!]\s+)"
+    r"(\d+|-)(:\s+)([0-9a-f]{7,40}|-+)(.*)$")
+
+
+def _sgr(code: str, text: str) -> str:
+    """Wrap `text` in an SGR `code` plus a reset. Per-line, so colour can't bleed
+    across lines in the pager."""
+    return f"\x1b[{code}m{text}{_RESET}"
+
+
+def _rangediff_row(m: "re.Match") -> str:
+    """Tint the two abbreviated shas of a `git range-diff` commit-pair row.
+
+    Rebuilt from the _RANGEDIFF_RE groups (which cover the whole line), wrapping
+    each sha token — but not the `-------` placeholder a one-sided row uses — in
+    the commit colour; every other byte is copied verbatim, so stripping the SGR
+    reproduces the input.
+    """
+    g = m.groups()
+    def sha(tok: str) -> str:
+        return tok if tok[0] == "-" else _sgr(_C_COMMIT, tok)
+    return g[0] + g[1] + sha(g[2]) + g[3] + g[4] + g[5] + sha(g[6]) + g[7]
+
+
+def _colorize(text: str) -> str:
+    """Re-colour already-sanitised diff text with our own SGR codes.
+
+    A structure-aware recolour of git's --color=never output. The input has been
+    through _sanitize and so carries no ESC byte; every escape in the result is
+    therefore one of the fixed _C_* codes above — none is derived from the
+    untrusted diff. Colours follow git's diff defaults so the view reads like a
+    normal `git diff`; context lines are left uncoloured, exactly as git leaves
+    them. Purely additive: strip the SGR codes back out and the text is unchanged.
+    """
+    out: "list[str]" = []
+    in_hunk = False
+    hunk_cols = 1                            # +/- marker columns; 2+ in a combined diff
+    for line in text.split("\n"):
+        if in_hunk:
+            prefix = line[:hunk_cols]        # one marker column per diff parent
+            if "+" in prefix:
+                out.append(_sgr(_C_NEW, line)); continue
+            if "-" in prefix:
+                out.append(_sgr(_C_OLD, line)); continue
+            if line[:1] in (" ", "\\", ""):  # context / "\ No newline" / blank
+                out.append(line); continue
+            in_hunk = False                  # anything else ends the hunk body
+        m = _HUNK_RE.match(line)
+        if m:                                # a real @@..@@ header; a stray "@@ prose"
+            in_hunk = True                   # has no closing @@ and won't match here,
+            frag = m.group(1)                # so it can't spuriously open a hunk body
+            hunk_cols = len(frag) - len(frag.lstrip("@")) - 1   # @@ -> 1, @@@ -> 2, ...
+            out.append(_sgr(_C_FRAG, frag) + m.group(2))
+        elif _DIFF_META_RE.match(line):
+            out.append(_sgr(_C_META, line))
+        elif line.lstrip().startswith("[!]"):
+            out.append(_sgr(_C_HAZARD, line))
+        else:
+            rd = _RANGEDIFF_RE.match(line)
+            c = None if rd else _COMMIT_RE.match(line)
+            if rd:                           # range-diff commit-pair row: tint its shas
+                out.append(_rangediff_row(rd))
+            elif c:                          # log --oneline row: colour the leading sha
+                out.append(_sgr(_C_COMMIT, c.group(0)) + line[c.end():])
+            else:
+                out.append(line)
+    return "\n".join(out)
+
+
+def _color_enabled() -> bool:
+    """Whether to add colour. Honours the NO_COLOR convention (no-color.org): any
+    non-empty NO_COLOR disables it."""
+    return not os.environ.get("NO_COLOR")
+
+
 def _page(text: str, paginate: bool) -> None:
     """Emit `text`, through `less` when `paginate`, else straight to stdout.
 
     The diff content is untrusted and git does not escape control sequences
     embedded in it (a hostile bundle can carry cursor-moves / screen-clears /
     overwrites), so the text is sanitised here before it can reach a terminal —
-    _page, not the pager, is the security boundary. Every escape is stripped,
-    colour included: the colour-preserving path was removed because keeping SGR
-    sequences while dropping the rest let a control-byte-split CSI (e.g.
-    ESC '[' DEL '2' 'J') be reassembled into a live clear/cursor escape once the
-    wedged control byte was stripped — past the pager, the thing this guard
-    exists to stop. $PAGER / $GIT_PAGER are deliberately *not* honoured (an
-    inherited `PAGER=cat` would relay raw bytes), LESS is cleared so an inherited
-    `LESS=-r` can't re-enable raw output, and LESSSECURE shuts off less's own
-    shell/file escapes. When piped or when less is missing, the same stripped
-    text is written straight out.
+    _page, not the pager, is the security boundary. Every git-emitted escape is
+    stripped, colour included: keeping SGR while dropping the rest once let a
+    control-byte-split CSI (e.g. ESC '[' DEL '2' 'J') be reassembled into a live
+    clear/cursor escape after the wedged byte was stripped — past the pager, the
+    thing this guard exists to stop.
 
-    TODO (restore colour safely): add a diff *parser* that re-colours the
-    already-sanitised text itself — emitting its own SGR sequences from parsed
-    diff structure (hunks, +/- lines) — instead of ever passing git's escapes
-    through. Then no untrusted escape is trusted to be "just colour"; the colour
-    is generated host-side from text that has already had every escape removed.
+    Colour is added back only *after* that scrub, and only for the terminal: on
+    the paginate path _colorize re-derives it from the now escape-free text's own
+    diff structure and emits our own SGR codes, so the only escapes less ever sees
+    are ones we generated, never anything attacker-derived. That is why `less -R`
+    (which renders SGR raw) is safe here even though the input is untrusted: the
+    scrub already removed every foreign escape. $PAGER / $GIT_PAGER are still not
+    honoured (an inherited `PAGER=cat` would relay raw bytes), LESS is cleared so
+    an inherited `LESS=-r` can't widen -R into full raw mode, and LESSSECURE shuts
+    off less's own shell/file escapes. When piped (paginate is False) the text is
+    written straight out with no colour, like git's --color=auto; if less is
+    missing the same post-scrub text is written out but still carries whatever
+    colour was added above — paginate implies a tty, where our own SGR renders.
     """
     safe = _sanitize(text)
     if not paginate:
-        _write(safe)
+        _write(safe)                       # piped: no colour, matching git
         return
+    if _color_enabled():
+        safe = _colorize(safe)
     env = {**os.environ, "LESS": "", "LESSSECURE": "1"}
     try:
-        subprocess.run(["less", "-F", "-X"], env=env,
+        # -R: render our SGR colour raw. Safe only because `safe` is post-scrub —
+        # its sole escapes are the SGR codes _colorize just added (less -R also
+        # passes OSC-8 links raw, but _sanitize removed every OSC and _colorize
+        # emits none), so -R can interpret nothing that came from the diff.
+        subprocess.run(["less", "-R", "-F", "-X"], env=env,
                        input=safe.encode("utf-8", "surrogateescape"))
     except OSError:
-        _write(safe)
+        _write(safe)                       # less absent: our coloured (tty-safe) text
 
 
 # git versions before this lack the checkout path-traversal hardening

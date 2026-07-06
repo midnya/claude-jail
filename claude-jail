@@ -627,7 +627,7 @@ def build_jail(user_flag: "str | None", config_path: str,
     }
     # git-review isolation (opt-in): jail the config's own root dev-container
     # style — live working tree, .git shadowed by a throwaway clone of the
-    # read-only original at /cvs/git — and route the session's commits back as a
+    # read-only original at /vcs/git — and route the session's commits back as a
     # reviewable bundle dropped in a host spool. The isolated root is the config's
     # own directory (the project repo).
     review_ctx = None
@@ -653,14 +653,14 @@ def build_jail(user_flag: "str | None", config_path: str,
             die("review needs a writable project root, but this root is read_only")
         # A `hidden: [".git"]` (whole-.git) mask can't be honoured in review mode:
         # requested_for_root drops it from the writable shadow, and the real .git
-        # is exposed read-only at /cvs/git so the shadow can borrow its objects —
+        # is exposed read-only at /vcs/git so the shadow can borrow its objects —
         # so the mask that emptied .git in a normal run would silently stop
         # applying, leaking the real .git (credentials in .git/config, remote
         # URLs). Rather than leak, refuse; the user can hide specific .git
-        # sub-paths (review re-masks those over /cvs/git) or drop review here.
+        # sub-paths (review re-masks those over /vcs/git) or drop review here.
         if any(build_mounts.is_gitdir(h) for h in iso_root.hidden):
             die("review can't isolate a root whose whole .git is hidden — it would "
-                "expose the real .git at /cvs/git; hide specific .git sub-paths "
+                "expose the real .git at /vcs/git; hide specific .git sub-paths "
                 "(e.g. .git/config) instead, or turn review off for this repo")
         # Only a launch has a resolved store base; without one we leave isolation
         # off here and let main()'s launch path report the missing base. The per-run
@@ -686,7 +686,7 @@ def build_jail(user_flag: "str | None", config_path: str,
                               iso_root, config_class, isolate=True)}
             environment["JAIL_GIT_ORIGINAL"] = build_mounts.original_git_path(
                 iso_root.dir)
-            environment["JAIL_REVIEW_SPOOL"] = build_mounts.CVS_SPOOL
+            environment["JAIL_REVIEW_SPOOL"] = build_mounts.VCS_SPOOL
     # Pinned (the COMPOSE_PROFILES-style defensive pin) so an inherited JAIL_REVIEW
     # can't switch the entrypoint's git-review path on for a non-review run.
     environment["JAIL_REVIEW"] = "1" if review_ctx else ""

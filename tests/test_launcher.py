@@ -709,11 +709,11 @@ class ReviewIsolationBuildTests(JailTestCase):
         self.assertEqual(review_ctx["repo"], proj)
         self.assertEqual(env["JAIL_REVIEW"], "1")
         self.assertTrue(env["JAIL_GIT_ORIGINAL"].endswith(proj))
-        self.assertEqual(env["JAIL_REVIEW_SPOOL"], "/cvs/spool")
+        self.assertEqual(env["JAIL_REVIEW_SPOOL"], "/vcs/spool")
         # the override carries the isolation mounts (real .git, gitdir, spool)
-        self.assertIn(f"/cvs/git{proj}", override)
+        self.assertIn(f"/vcs/git{proj}", override)
         self.assertIn(review_ctx["gitdir"], override)
-        self.assertIn("/cvs/spool", override)
+        self.assertIn("/vcs/spool", override)
 
     def test_review_off_by_default(self):
         base = self.tmpdir()
@@ -722,7 +722,7 @@ class ReviewIsolationBuildTests(JailTestCase):
             None, cfg, None, base, store_must_exist=True)
         self.assertIsNone(review_ctx)
         self.assertEqual(env["JAIL_REVIEW"], "")
-        self.assertNotIn("/cvs/git", override)
+        self.assertNotIn("/vcs/git", override)
 
     def test_review_flag_forces_isolation_without_config_key(self):
         base = self.tmpdir()
@@ -794,7 +794,7 @@ class ReviewIsolationBuildTests(JailTestCase):
 
     def test_review_rejects_whole_git_hidden(self):
         # A `hidden: [".git"]` mask can't be honoured in review mode (the real .git
-        # is exposed read-only at /cvs/git for object borrowing), so it would leak
+        # is exposed read-only at /vcs/git for object borrowing), so it would leak
         # the .git the user meant to hide — build_jail refuses rather than leak.
         base = self.tmpdir()
         proj, cfg = self._config(
@@ -807,7 +807,7 @@ class ReviewIsolationBuildTests(JailTestCase):
         # The refusal must normalize like the mask machinery: a non-canonical
         # spelling such as ".git/." still masks the entire .git in a normal run, so
         # review must refuse it too — a raw string compare would let it slip past
-        # and leave the real .git exposed read-only at /cvs/git to the agent.
+        # and leave the real .git exposed read-only at /vcs/git to the agent.
         base = self.tmpdir()
         proj, cfg = self._config(
             '{"user": "t", "review": true, '
@@ -817,12 +817,12 @@ class ReviewIsolationBuildTests(JailTestCase):
 
     def test_review_allows_git_subpath_hidden(self):
         # Hiding a specific .git sub-path is fine — override() re-masks it over
-        # /cvs/git — so review is NOT refused for it.
+        # /vcs/git — so review is NOT refused for it.
         base = self.tmpdir()
         proj, cfg = self._config(
             '{"user": "t", "review": true, '
             '"roots": [{"path": ".", "hidden": [".git/config"]}]}')
-        # The masked .git sub-path must exist to be re-masked over /cvs/git; an
+        # The masked .git sub-path must exist to be re-masked over /vcs/git; an
         # absent one is a hard error (a typo), just as in a normal run.
         self.write(os.path.join(proj, ".git", "config"), "x")
         _env, _o, _s, review_ctx = L.build_jail(
@@ -832,7 +832,7 @@ class ReviewIsolationBuildTests(JailTestCase):
     def test_review_rejects_absent_git_subpath_hidden(self):
         # A mistyped `.git/...` hidden entry must fail loudly in review mode, not
         # be silently dropped — otherwise the real .git sub-path it meant to hide
-        # stays readable to the agent through the read-only /cvs/git mount.
+        # stays readable to the agent through the read-only /vcs/git mount.
         base = self.tmpdir()
         _proj, cfg = self._config(
             '{"user": "t", "review": true, '

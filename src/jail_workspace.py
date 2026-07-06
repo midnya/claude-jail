@@ -4,12 +4,12 @@
 Runs inside the jail (the entrypoint calls `jail-workspace init` before claude
 and `jail-workspace export` after) when review isolation is on. It is the half
 of the feature that must run container-side, because the writable .git borrows
-objects from the real repo via an alternate at /cvs/git — a *container* path that
+objects from the real repo via an alternate at /vcs/git — a *container* path that
 only resolves here.
 
   init   The working tree is a live two-way mount; its .git is an empty writable
          volume shadowing the host's real .git. Turn that volume into a clone of
-         the read-only original at /cvs/git: init, point an alternate at the
+         the read-only original at /vcs/git: init, point an alternate at the
          original's objects (borrow, don't copy), fetch its refs, then set HEAD
          and the index to the original's HEAD *without* touching the live working
          tree — so the user's uncommitted changes still show up as diffs. Every
@@ -420,12 +420,12 @@ def _original_commit_tips(original: str) -> "list[str]":
     """Commit tips of the read-only original's branches+tags+HEAD, as an exclusion
     floor for export.
 
-    Read straight from /cvs/git *at export time* (not the host-written
+    Read straight from /vcs/git *at export time* (not the host-written
     pending.base), so two failure modes are closed: a commit the user landed on
     the real repo *during* the session — present in the original but absent from
     the pre-session snapshot — is still excluded rather than mis-attributed to the
     agent; and a session that tampered with the jail-writable pending.base can't
-    smuggle the whole pre-existing history into the bundle, because /cvs/git is
+    smuggle the whole pre-existing history into the bundle, because /vcs/git is
     read-only and its tips always exclude it. Peeled to commits (an annotated tag
     -> its commit, a non-commit tag skipped) so no non-commit sha reaches
     `bundle --not` and errors the capture.
@@ -547,7 +547,7 @@ def main(argv: "list[str]") -> int:
     spool = os.environ.get("JAIL_REVIEW_SPOOL")
     if not spool:
         sys.exit("jail-workspace: JAIL_REVIEW_SPOOL is not set")
-    # The read-only original (/cvs/git) is an exclusion floor the session can't
+    # The read-only original (/vcs/git) is an exclusion floor the session can't
     # tamper with; optional so a caller without it still exports off pending.base.
     original = os.environ.get("JAIL_GIT_ORIGINAL")
     return export(workdir, spool, original)

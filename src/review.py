@@ -1215,7 +1215,7 @@ def _spool(base: str, jail_user: str) -> Path:
     /home/claude/.claude, so a quarantine kept inside it would be readable and
     rewritable by the very session under review (and by every other run sharing the
     user). The per-run handshake spool the jail does write to is bound on its own
-    at /cvs/spool and lives under this dir keyed per run.
+    at /vcs/spool and lives under this dir keyed per run.
     """
     cfg = user_config_dir(Path(base), jail_user)
     return cfg.parent / f"{cfg.name}-review"

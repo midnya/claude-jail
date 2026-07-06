@@ -21,7 +21,7 @@ Because most of Claude Code features rely on arbitrary code execution, we try to
 the attack surface as much as possible, while still offering convenience for day-to-day
 operations:
 - Filesystem protection: bypasses Claude's sandbox feature and relies on Docker's instead.
-  - CVS directories are read-only by default.
+  - VCS directories are read-only by default.
     - Opt-in "review" mode where modifications to .git are bundled
       after container's teardown and available for human review.
   - For convenience, `/tmp` is a persisted volume that is shared per-workspace,

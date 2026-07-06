@@ -46,7 +46,7 @@ def review_enabled(data: "dict", config_file: str) -> bool:
 
     When true the config's own root is jailed dev-container style: the working
     tree stays a live two-way mount, but its .git is shadowed by a throwaway
-    writable clone of the real repo (read-only at /cvs/git), so the session's
+    writable clone of the real repo (read-only at /vcs/git), so the session's
     commits come back as a reviewable bundle instead of touching real history.
     """
     value = data.get("review", False)

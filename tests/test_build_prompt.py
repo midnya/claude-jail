@@ -1,7 +1,7 @@
 """Tests for build_prompt.py: system_prompts resolution and prompt assembly."""
 import os
 
-from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
+from jail_test_helpers import REPO_ROOT, JailTestCase  # noqa: I001 (puts src/ on sys.path)
 
 import build_prompt as bp
 from build_packages import Packages
@@ -225,3 +225,54 @@ class MergeTests(JailTestCase):
                        "/workspace" + root, Packages(apt=[], pip=[], npm=[]))
         self.assertIn("# Installed packages", out)
         self.assertIn("none requested", out)
+
+
+class ReviewBaseTests(JailTestCase):
+    """The git-review rewrite drops the base prompt's read-only-git claims."""
+
+    def base(self):
+        return (REPO_ROOT / "system-prompt.md").read_text(encoding="utf-8")
+
+    def test_real_base_has_the_anchors(self):
+        # Guards drift: if the base file is reworded, review_base() can no longer
+        # find its bullets and would silently leave stale text, so it die()s —
+        # here we assert it does NOT exit on the shipping base, proving the
+        # anchors still match. (The failure mode is exercised separately below.)
+        out = bp.review_base(self.base())
+        self.assertNotEqual(out, self.base())
+
+    def test_drops_no_git_writes_bullet(self):
+        out = bp.review_base(self.base())
+        self.assertNotIn("No git write operations", out)
+        # The wrapped continuation line is indented with two spaces in the base;
+        # match it exactly so this asserts the wrapped body went too, not a
+        # substring that was never present regardless of review_base().
+        self.assertNotIn("mounted\n  read-only, so these fail anyway", out)
+
+    def test_drops_dot_git_from_read_only_paths_bullet(self):
+        out = bp.review_base(self.base())
+        # The read-only-paths bullet survives, but without its ".git" clause.
+        self.assertIn("Some paths are mounted read-only", out)
+        self.assertNotIn("Besides each root's `.git`", out)
+
+    def test_unknown_base_dies_rather_than_noop(self):
+        with self.assertRaises(SystemExit):
+            bp.review_base("nothing git-related in here")
+
+
+class MergeReviewTests(JailTestCase):
+    def test_review_true_drops_git_readonly_claims(self):
+        root = self.tmpdir()
+        base = (REPO_ROOT / "system-prompt.md").read_text(encoding="utf-8")
+        out = bp.merge(base, {}, "cfg.json", self.roots(root), True,
+                       "/workspace" + root, review=True)
+        self.assertNotIn("No git write operations", out)
+        self.assertNotIn("Besides each root's `.git`", out)
+
+    def test_review_false_keeps_git_readonly_claims(self):
+        root = self.tmpdir()
+        base = (REPO_ROOT / "system-prompt.md").read_text(encoding="utf-8")
+        out = bp.merge(base, {}, "cfg.json", self.roots(root), True,
+                       "/workspace" + root)
+        self.assertIn("No git write operations", out)
+        self.assertIn("Besides each root's `.git`", out)

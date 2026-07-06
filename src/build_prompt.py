@@ -35,6 +35,51 @@ from jail_config import (Root, config_dir, confine_to_roots, container_path,
 
 SETTING = "system_prompts"
 
+# Under git-review the agent's .git is writable and its commits are captured for
+# review, so the base prompt's read-only-git guidance is wrong. The review
+# machinery is meant to be transparent, so rather than explain it, review_base()
+# just drops the git-specific read-only claims: the "no git writes" bullet goes
+# entirely, and the read-only-paths bullet loses its ".git" clause. Each `old` is
+# the exact base-prompt text (joined line-by-line so the wrapping matches
+# system-prompt.md); a mismatch — the base file was reworded without updating
+# these — dies rather than silently leaving the stale text, and a test drives
+# the real base file through review_base() to catch that drift.
+_REVIEW_SUBSTITUTIONS = (
+    ("\n".join([
+        "- **No git write operations.** Do not run git commands that change history or",
+        "  refs — no `commit`, `push`, `pull`, `merge`, `rebase`, `reset`, branch",
+        "  `checkout`/`switch`, `tag`, `stash`, etc. The `.git` directory is mounted",
+        "  read-only, so these fail anyway. Read-only git commands (`status`, `log`,",
+        "  `diff`, `show`, `blame`) are fine.",
+     ]) + "\n", ""),
+    ("\n".join([
+        "- **Some paths are mounted read-only.** Besides each root's `.git`, any paths",
+        "  the jail config lists under a root's `read_only` are bind-mounted read-only.",
+     ]),
+     "\n".join([
+        "- **Some paths are mounted read-only.** Any paths the jail config lists under a",
+        "  root's `read_only` are bind-mounted read-only.",
+     ])),
+)
+
+
+def review_base(base: str) -> str:
+    """Drop the base prompt's read-only-git claims for git-review mode.
+
+    Under review the agent's .git is writable, so the base prompt's "no git
+    writes / .git is read-only" guidance is wrong; review is transparent, so we
+    just remove those claims rather than explain the machinery. Every anchor must
+    be present — a missing one means the base file was reworded without updating
+    the substitution here, which would silently ship contradictory instructions,
+    so die() instead of no-op'ing.
+    """
+    for old, new in _REVIEW_SUBSTITUTIONS:
+        if old not in base:
+            die("review_base: base prompt no longer contains an expected git "
+                "bullet; update _REVIEW_SUBSTITUTIONS to match system-prompt.md")
+        base = base.replace(old, new)
+    return base
+
 
 def prompt_path(cfg_dir: str, roots: "list[Root]", config_in_jail: bool,
                 rel: str) -> Path:
@@ -189,7 +234,7 @@ def packages_segment(packages: "Packages") -> str:
 
 def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
           config_in_jail: bool, workdir: str,
-          packages: "Packages | None" = None) -> str:
+          packages: "Packages | None" = None, review: bool = False) -> str:
     """Merge the base jail prompt, the runtime sections, and the project prompt.
 
     In order: the base jail prompt, the generated project-roots section, the
@@ -197,8 +242,12 @@ def merge(base: str, data: "dict", config_file: str, roots: "list[Root]",
     venv's contents, or their absence), then the project's own system_prompts,
     separated by blank lines. With no project prompt the generated sections still
     pass through. `workdir` is the container working directory the agent starts
-    in.
+    in. `review` (git-review isolation is on for this run) drops the base prompt's
+    read-only-git claims, which don't hold when the agent's .git is a writable
+    review clone.
     """
+    if review:
+        base = review_base(base)
     extra = user_prompt(data, config_file, config_dir(config_file), roots,
                         config_in_jail)
     sections = (base, roots_segment(roots, workdir),

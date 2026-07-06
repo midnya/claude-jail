@@ -571,9 +571,18 @@ def build_jail(user_flag: "str | None", config_path: str,
     config_class = classify_config(roots, config_path)
     workdir = container_workdir(config_path)
     packages = build_packages.parse(data, config_path)
+    # Whether git-review isolation is on for this run (the config's `review` key
+    # or the --review flag). Resolved here so the prompt can drop its read-only-git
+    # guidance when the agent's .git will be a writable review clone; the isolation
+    # setup below reuses it. review_enabled runs unconditionally so a bad `review`
+    # value still fails on any command, but only a launch (store_must_exist)
+    # actually engages the isolation — a non-launch command's prompt is never used,
+    # so gate the prompt rewrite on that too.
+    review_on = review_enabled(data, config_path) or review_flag
     prompt = build_prompt.merge(PROMPT_FILE.read_text(encoding="utf-8"), data,
                                 config_path, roots, config_class is not None,
-                                workdir, packages)
+                                workdir, packages,
+                                review=review_on and store_must_exist)
     jail_id, project = jail_identity(config_path)
     # One resolve of the egress policy renders the proxy ACL, the DNS ACL, and the
     # canonical policy key together.
@@ -622,13 +631,11 @@ def build_jail(user_flag: "str | None", config_path: str,
     # reviewable bundle dropped in a host spool. The isolated root is the config's
     # own directory (the project repo).
     review_ctx = None
-    # review_enabled runs unconditionally so a bad `review` value still fails on any
-    # command; the --review flag forces it on regardless of the config. The
-    # isolation setup below — and its .git/read_only preconditions, which die() —
-    # only run for a command that actually launches a session (store_must_exist):
+    # review_on was resolved above (config `review` or --review flag). The
+    # isolation setup here — and its .git/read_only preconditions, which die() —
+    # only runs for a command that actually launches a session (store_must_exist):
     # down/logs/ps neither capture nor need review and must keep working even when
     # the repo's .git is a worktree gitfile or the project dir is gone.
-    review_on = review_enabled(data, config_path) or review_flag
     if review_on and store_must_exist:
         iso_root = next((r for r in roots if r.dir == config_dir(config_path)),
                         None)

@@ -119,6 +119,15 @@ Run from the directory that holds your `.claude-jail.json` (or point `-c` at it)
 claude-jail -c ~/code/myproject/.claude-jail.json
 ```
 
+`--dind` uses a different image and container configuration,
+adding Docker-in-Docker capabilities.
+Mostly meant for development, but you may have a use for it.
+Not as thoroughly vetted as the rest of the code, **use at your own risk**.
+
+```sh
+claude-jail --dind new
+```
+
 ### Review
 
 When a session runs with `review` on, the commits come back as a quarantined

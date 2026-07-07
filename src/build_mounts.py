@@ -36,8 +36,13 @@ KEYS = ("read_only", "hidden")
 # isolation mounts reads from one place instead of scattering the literal.
 GITDIR = ".git"
 
+# Other popular VCS metadata dirs protected read-only on every root. Unlike .git,
+# git-review gives them no writable shadow, so they stay read-only even in isolate
+# mode (see requested_for_root) — a review run must not silently un-protect them.
+OTHER_VCS_READ_ONLY = [".hg", ".svn"]
+
 # Built-in read_only policy applied to every root.
-DEFAULT_READ_ONLY = [GITDIR]
+DEFAULT_READ_ONLY = [GITDIR, *OTHER_VCS_READ_ONLY]
 
 # Container mount points for git-review isolation (see override()). The real
 # repo's .git is exposed read-only under VCS_GIT_PREFIX + <host path> (mirroring
@@ -121,9 +126,10 @@ def requested_for_root(root: Root, config_class: "tuple[str, str] | None",
 
     `isolate` (git-review) drops the built-in read-only .git mount: override()
     replaces it with a writable .git volume and a read-only original elsewhere,
-    so the default would only fight that overmount.
+    so the default would only fight that overmount. The other VCS dirs
+    (OTHER_VCS_READ_ONLY) get no such shadow, so they stay read-only under review.
     """
-    default_ro = [] if isolate else list(DEFAULT_READ_ONLY)
+    default_ro = list(OTHER_VCS_READ_ONLY) if isolate else list(DEFAULT_READ_ONLY)
     requested = {"read_only": default_ro, "hidden": [CONFIG_NAME]}
     mask_absent = {CONFIG_NAME}
     if config_class is not None and config_class[0] == root.dir:

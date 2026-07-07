@@ -20,14 +20,21 @@ def mounts_for(read_only=None, hidden=None):
 class RequestedForRootTests(JailTestCase):
     def test_defaults(self):
         requested, mask_absent = bm.requested_for_root(Root("/r", [], []), None)
-        self.assertEqual(requested["read_only"], [".git"])
+        self.assertEqual(requested["read_only"], [".git", ".hg", ".svn"])
         self.assertEqual(requested["hidden"], [bm.CONFIG_NAME])
         self.assertEqual(mask_absent, {bm.CONFIG_NAME})
 
     def test_root_lists_appended(self):
         requested, _ = bm.requested_for_root(Root("/r", ["ro"], ["hid"]), None)
-        self.assertEqual(requested["read_only"], [".git", "ro"])
+        self.assertEqual(requested["read_only"], [".git", ".hg", ".svn", "ro"])
         self.assertEqual(requested["hidden"], [bm.CONFIG_NAME, "hid"])
+
+    def test_isolate_drops_git_but_keeps_other_vcs(self):
+        # git-review shadows .git with a writable overmount, so the built-in .git
+        # read-only is dropped; .hg/.svn get no shadow and stay protected.
+        requested, _ = bm.requested_for_root(
+            Root("/r", [], []), None, isolate=True)
+        self.assertEqual(requested["read_only"], [".hg", ".svn"])
 
     def test_active_config_masked_in_its_own_root(self):
         rel = "sub/.claude-jail.json"
@@ -394,6 +401,22 @@ class OverrideTests(JailTestCase):
         isolated, _ = bm.override([Root(root, [], [])], None, isolation=iso)
         self.assertIn(f'source: "/host/gitdir"\n        {git_target}', isolated)
         self.assertNotIn(f'source: "{root}/.git"\n        {git_target}', isolated)
+
+    def test_isolation_keeps_other_vcs_read_only(self):
+        # .git loses its read-only overmount under review (it gets the writable
+        # shadow), but .hg/.svn have no shadow and must stay read-only even in
+        # isolate mode — a review run must not silently un-protect them.
+        root = self.tmpdir()
+        self.mkdir(os.path.join(root, ".git"))
+        self.mkdir(os.path.join(root, ".hg"))
+        self.mkdir(os.path.join(root, ".svn"))
+        iso = {"repo": root, "gitdir": "/host/gitdir", "spool": "/host/spool"}
+        isolated, _ = bm.override([Root(root, [], [])], None, isolation=iso)
+        for vcs in (".hg", ".svn"):
+            self.assertIn(
+                f'source: "{root}/{vcs}"\n        '
+                f'target: "/workspace{root}/{vcs}"\n        read_only: true',
+                isolated)
 
     def test_isolation_moves_dot_git_masks_off_shadow_onto_vcs_git(self):
         # A hidden/read_only mask at /workspace<root>/.git/* would stack a read-only

@@ -261,7 +261,9 @@ Notes:
 - Egress is default-deny: without an `egress` key the jail can reach only
   `*.anthropic.com` and `*.claude.com`. A domain pattern matches the host and
   every subdomain; a CIDR is matched by range. A prefix must be provided.
-- `.git` in every root is always read-only.
+- The VCS metadata dirs `.git`, `.hg`, and `.svn` in every root are always
+  read-only. Under git-review `.git` becomes a writable throwaway shadow (its real
+  history stays read-only elsewhere).
 - Each root must be an existing directory; roots may not be nested in or
   duplicate one another, nor be the filesystem root `/`, the config store
   directory (`claude_dir_base`, default `$HOME`), or a directory containing it —
@@ -278,8 +280,8 @@ Notes:
 - Per-root `read_only`/`hidden` paths must be relative and stay inside their
   root. When a path is listed under both, `hidden` wins.
 - A `read_only` entry of `"."` (the root itself) makes the whole root
-  read-only; the per-path `read_only` list and the always-on `.git` rule become
-  redundant and are dropped. `hidden` may not name the root itself.
+  read-only; the per-path `read_only` list and the always-on VCS read-only rules
+  become redundant and are dropped. `hidden` may not name the root itself.
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
 - A missing or empty `system_prompts.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.

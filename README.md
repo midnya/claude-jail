@@ -53,7 +53,7 @@ operations:
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--ide] [COMMAND] [args...]
+claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--ide] [--system-prompt <text>]... [--system-prompt-file <path>]... [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
@@ -69,6 +69,13 @@ claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subne
   `10.123.45.0/24`). Must be a private (RFC1918) range, `/26` or larger.
 - `--ide`: bridge the in-jail `/ide` to a code editor running on the host.
   Off by default.
+- `--system-prompt <text>`: append an extra system prompt (inline literal text)
+  to the jail's built-in one, after the config's `system_prompts`. Repeatable.
+- `--system-prompt-file <path>`: append an extra system prompt read from a file.
+  A relative path resolves against the config file's directory, an absolute path
+  is used as-is, and the read never follows a symlink. You supply it (not the
+  agent), so unlike an in-jail config's own `system_prompts` file it is trusted to
+  live anywhere on the host. Repeatable.
 - `[COMMAND] [args...]`: one of the commands below. With no command, `run` is assumed.
 
 ## Commands

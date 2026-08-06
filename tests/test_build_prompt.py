@@ -10,8 +10,8 @@ from jail_config import Root
 
 class ResolveSegmentTests(JailTestCase):
     def seg(self, value, root, in_jail=True):
-        return bp.resolve_segment(value, "cfg.json", root, self.roots(root),
-                                  in_jail)
+        return bp.resolve_segment(value, "'system_prompts' in cfg.json", root,
+                                  self.roots(root), in_jail)
 
     def test_inline_string_verbatim(self):
         self.assertEqual(self.seg("hello", self.tmpdir()), "hello")
@@ -34,7 +34,7 @@ class ResolveSegmentTests(JailTestCase):
             self.seg({"path": "p.md", "x": 1}, self.tmpdir())
 
     def test_dict_path_not_string(self):
-        with self.assertDies("'system_prompts.path'", "non-empty string"):
+        with self.assertDies("'system_prompts'", "path must be a non-empty string"):
             self.seg({"path": 5}, self.tmpdir())
 
     def test_file_not_found(self):
@@ -100,6 +100,77 @@ class UserPromptTests(JailTestCase):
     def test_invalid_type(self):
         with self.assertDies("must be a string, a"):
             self.up({"system_prompts": 5}, self.tmpdir())
+
+
+class CliPromptTests(JailTestCase):
+    """--system-prompt / --system-prompt-file segments. A --system-prompt-file
+    path resolves like a config system_prompts.path (relative to the config dir,
+    no symlink) but is operator-supplied, so it is trusted anywhere and NOT
+    confined to the roots."""
+
+    def cli(self, segments, cfg_dir):
+        return bp.cli_prompt(segments, cfg_dir, self.roots(cfg_dir))
+
+    def test_none_when_absent(self):
+        self.assertIsNone(self.cli(None, self.tmpdir()))
+        self.assertIsNone(self.cli([], self.tmpdir()))
+
+    def test_inline_verbatim(self):
+        self.assertEqual(self.cli([("inline", "hi")], self.tmpdir()), "hi")
+
+    def test_path_read_relative_to_config_dir(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "from file")
+        self.assertEqual(self.cli([("path", "p.md")], root), "from file")
+
+    def test_segments_joined_in_command_line_order(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "p.md"), "MID")
+        out = self.cli([("inline", "A"), ("path", "p.md"), ("inline", "B")], root)
+        self.assertEqual(out, "A\n\nMID\n\nB")
+
+    def test_inline_empty_rejected_naming_the_flag(self):
+        # The error attributes the bad segment to the CLI flag, not the config
+        # file. The space in "--system-prompt argument" is load-bearing: it keeps
+        # the needle from matching --system-prompt-file's label, so this pins the
+        # error to the inline flag, not --system-prompt-file's.
+        with self.assertDies("--system-prompt argument", "must not be empty"):
+            self.cli([("inline", "  ")], self.tmpdir())
+
+    def test_path_outside_roots_allowed(self):
+        # Unlike an in-jail config's own system_prompts.path, a --system-prompt-file
+        # is operator-supplied, so it is trusted to live anywhere and is NOT
+        # confined to the roots — an absolute path outside every root is read.
+        root = self.tmpdir()
+        outside = self.tmpdir()
+        self.write(os.path.join(outside, "p.md"), "trusted")
+        self.assertEqual(
+            self.cli([("path", os.path.join(outside, "p.md"))], root), "trusted")
+
+    def test_relative_path_climbing_out_of_roots_allowed(self):
+        # A trusted path may also climb out with `..`, which confine_to_roots
+        # would reject for a config's own path.
+        base = self.tmpdir()
+        root = self.mkdir(os.path.join(base, "proj"))
+        self.write(os.path.join(base, "shared.md"), "climbed")
+        self.assertEqual(self.cli([("path", "../shared.md")], root), "climbed")
+
+    def test_path_via_symlink_refused(self):
+        # The no-symlink invariant survives the trust relaxation: an agent-planted
+        # symlink inside a root still cannot redirect the read at a host secret.
+        root = self.tmpdir()
+        secret = self.tmpdir()
+        self.write(os.path.join(secret, "secret.md"), "SECRET")
+        self.symlink(os.path.join(root, "link.md"),
+                     os.path.join(secret, "secret.md"))
+        with self.assertDies("--system-prompt-file", "symlink"):
+            self.cli([("path", "link.md")], root)
+
+    def test_path_missing_rejected(self):
+        # A missing file is attributed to the flag the user passed, not to a
+        # 'system_prompts.path' config key they never set.
+        with self.assertDies("--system-prompt-file", "file not found"):
+            self.cli([("path", "nope.md")], self.tmpdir())
 
 
 class RootsSegmentTests(JailTestCase):
@@ -225,6 +296,29 @@ class MergeTests(JailTestCase):
                        "/workspace" + root, Packages(apt=[], pip=[], npm=[]))
         self.assertIn("# Installed packages", out)
         self.assertIn("none requested", out)
+
+    def test_cli_segments_appended_after_config_prompt(self):
+        # CLI --system-prompt/--system-prompt-file segments come after the
+        # config's own system_prompts and keep their command-line order. The cfg
+        # sits inside the root so the "p.md" path confines to it.
+        root = self.tmpdir()
+        cfg = os.path.join(root, ".claude-jail.json")
+        self.write(os.path.join(root, "p.md"), "FILESEG")
+        out = bp.merge("BASE", {"system_prompts": "CONFIG"}, cfg,
+                       self.roots(root), True, "/workspace" + root,
+                       cli_segments=[("inline", "CLITEXT"), ("path", "p.md")])
+        self.assertLess(out.index("CONFIG"), out.index("CLITEXT"))
+        self.assertLess(out.index("CLITEXT"), out.index("FILESEG"))
+        # A real blank-line separator, not bare concatenation.
+        self.assertIn("\n\nCLITEXT", out)
+
+    def test_cli_segments_without_config_prompt(self):
+        # With no config system_prompts the CLI segments still append, after the
+        # generated sections.
+        root = self.tmpdir()
+        out = bp.merge("BASE", {}, "cfg.json", self.roots(root), True,
+                       "/workspace" + root, cli_segments=[("inline", "ONLYCLI")])
+        self.assertLess(out.index("# Installed packages"), out.index("ONLYCLI"))
 
 
 class ReviewBaseTests(JailTestCase):

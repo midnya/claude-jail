@@ -109,6 +109,27 @@ class ParseArgsTests(JailTestCase):
     def test_claude_dir_base_defaults_to_none(self):
         self.assertIsNone(L.parse_args(["-u", "me"]).claude_dir_base)
 
+    def test_system_prompt_segments_default_none(self):
+        self.assertIsNone(L.parse_args(["-u", "me", "run"]).system_prompt_segments)
+
+    def test_system_prompt_flags_ordered_and_tagged(self):
+        # Both flags feed one list that preserves command-line order and tags
+        # each value inline/path; they must precede the command like our other flags.
+        args = L.parse_args([
+            "--system-prompt", "A", "--system-prompt-file", "p.md",
+            "--system-prompt", "B", "run", "-p", "hi"])
+        self.assertEqual(args.system_prompt_segments,
+                         [("inline", "A"), ("path", "p.md"), ("inline", "B")])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["-p", "hi"])
+
+    def test_system_prompt_flag_coexists_with_dashdash(self):
+        # Our flag is parsed; -- still forwards a leading-dash arg to claude.
+        args = L.parse_args(["--system-prompt", "X", "--", "--help"])
+        self.assertEqual(args.system_prompt_segments, [("inline", "X")])
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.command_args, ["--help"])
+
     def test_empty_user_rejected(self):
         # argparse prints usage to stderr then exits 2; swallow the noise.
         with contextlib.redirect_stderr(io.StringIO()), \

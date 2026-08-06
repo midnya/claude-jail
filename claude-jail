@@ -69,6 +69,22 @@ KNOWN_COMMANDS = ("run", "new", "build", "down", "logs", "ps", "prune",
 _DIND_COMMANDS = frozenset({"run", "new", "build", "down", "logs", "ps"})
 
 
+class _PromptSegmentAction(argparse.Action):
+    """Append each occurrence to one shared list as `(const, value)`.
+
+    Several options can point at the same `dest` with different `const` values;
+    their arguments then accumulate in a single list that preserves command-line
+    order across all of them, each tagged by its option's `const`. (argparse's
+    stock "append" can't do this — distinct options can't feed one ordered list.)
+    The list is created lazily on first use. The prompt flags wire this up: see
+    the `--system-prompt` / `--system-prompt-file` add_argument calls below.
+    """
+    def __call__(self, parser, namespace, value, option_string=None):
+        segments = getattr(namespace, self.dest) or []
+        segments.append((self.const, value))
+        setattr(namespace, self.dest, segments)
+
+
 def parse_args(argv: "list[str]") -> argparse.Namespace:
     """Parse the invocation into our flags plus a strict command.
 
@@ -136,6 +152,20 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              "service in every other respect; runs the container privileged, so "
              "it is for dev/testing only. A launch builds the image on demand; "
              "`--dind build` (re)builds it explicitly",
+    )
+    parser.add_argument(
+        "--system-prompt", metavar="TEXT", action=_PromptSegmentAction,
+        const="inline", dest="system_prompt_segments", default=None,
+        help="append an extra system prompt (inline literal text) to the jail's "
+             "built-in one, after the config's system_prompts. Repeatable; "
+             "interleaved with --system-prompt-file in order",
+    )
+    parser.add_argument(
+        "--system-prompt-file", metavar="PATH", action=_PromptSegmentAction,
+        const="path", dest="system_prompt_segments", default=None,
+        help="append an extra system prompt read from a file, resolved relative "
+             "to the config file's directory (not the cwd) and never through a "
+             "symlink. Repeatable; interleaved with --system-prompt in order",
     )
     parser.add_argument(
         "rest", nargs=argparse.REMAINDER, metavar="[COMMAND] [args...]",
@@ -543,7 +573,8 @@ def build_jail(user_flag: "str | None", config_path: str,
                subnet: "str | None" = None,
                claude_dir_base_flag: "str | None" = None,
                store_must_exist: bool = True,
-               review_flag: bool = False
+               review_flag: bool = False,
+               cli_prompt_segments: "list | None" = None
                ) -> "tuple[dict, str, list[str], dict | None]":
     """Validate the config and assemble the launch environment and mount override.
 
@@ -557,7 +588,9 @@ def build_jail(user_flag: "str | None", config_path: str,
     git-review {"repo", "spool"} when isolation is on (else None), telling main()
     where to seed the base manifest and adopt the session's bundle. `review_flag`
     (the --review CLI flag) forces that isolation on even when the config's
-    `review` key is unset.
+    `review` key is unset. `cli_prompt_segments` are the --system-prompt /
+    --system-prompt-file values, appended to the merged prompt after the config's
+    own system_prompts and resolved by the same rules.
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
@@ -582,7 +615,8 @@ def build_jail(user_flag: "str | None", config_path: str,
     prompt = build_prompt.merge(PROMPT_FILE.read_text(encoding="utf-8"), data,
                                 config_path, roots, config_class is not None,
                                 workdir, packages,
-                                review=review_on and store_must_exist)
+                                review=review_on and store_must_exist,
+                                cli_segments=cli_prompt_segments)
     jail_id, project = jail_identity(config_path)
     # One resolve of the egress policy renders the proxy ACL, the DNS ACL, and the
     # canonical policy key together.
@@ -858,7 +892,8 @@ def main() -> None:
                                                        args.command_args)
     environment, override, seeds, review_ctx = build_jail(
         args.user, config_path, args.subnet, args.claude_dir_base,
-        store_must_exist=launches, review_flag=args.review)
+        store_must_exist=launches, review_flag=args.review,
+        cli_prompt_segments=args.system_prompt_segments)
     # Review capture only works for a one-shot session: the launcher seeds the
     # spool, waits for the container, then adopts the bundle on teardown. A
     # persistent launch (up/start/watch) would prepare the gitdir but never

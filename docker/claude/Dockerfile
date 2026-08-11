@@ -1,5 +1,5 @@
 # From https://github.com/VishalJ99/claude-docker/commit/e8461c1dcf4150dc60b1b3180398a3a79511885a
-FROM node:20.18.1-slim
+FROM node:26-slim
 
 # delete default node user if exists
 # we will likely need his UID

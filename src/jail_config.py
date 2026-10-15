@@ -2,13 +2,13 @@
 
 claude-jail reads .claude-jail.json once and hands the parsed data to several
 small modules that each interpret their own slice of it — build_mounts.py
-(roots / read_only / hidden), build_env.py (default_mode), build_prompt.py
-(system_prompts) and resolve_user.py (user). This module is their single source
-of truth for the things they must agree on: how errors are reported, how the
-config is read and shape-checked, what counts as a shell-/compose-safe bare
-word, what the jail's roots are, how a path is resolved without letting it
-escape those roots (including via symlinks), and how a content key is reduced
-to a short, stable id.
+(roots / read_only / hidden), build_env.py (default_mode, mem_limit),
+build_prompt.py (system_prompts) and resolve_user.py (user). This module is
+their single source of truth for the things they must agree on: how errors are
+reported, how the config is read and shape-checked, what counts as a
+shell-/compose-safe bare word, what the jail's roots are, how a path is
+resolved without letting it escape those roots (including via symlinks), and
+how a content key is reduced to a short, stable id.
 
 The config is anchored on the config file, not a CLI directory: `roots` lists
 the directories bind-mounted into the jail (each with its own read_only/hidden
@@ -37,8 +37,9 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # per-root only (under a `roots` entry); rejecting them — and any other unknown
 # key — at the top level turns a silently-ignored legacy config or a typo into a
 # hard error, instead of a jail that quietly drops the protections they meant.
-TOP_LEVEL_KEYS = {"user", "uid", "gid", "default_mode", "system_prompts",
-                  "roots", "egress", "packages", "claude_dir_base", "review"}
+TOP_LEVEL_KEYS = {"user", "uid", "gid", "default_mode", "mem_limit",
+                  "system_prompts", "roots", "egress", "packages",
+                  "claude_dir_base", "review"}
 
 
 def review_enabled(data: "dict", config_file: str) -> bool:

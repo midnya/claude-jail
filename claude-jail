@@ -130,6 +130,11 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              "right value avoids this host's networks and the config is shared. "
     )
     parser.add_argument(
+        "--mem-limit", metavar="SIZE",
+        help='cap the jail container\'s memory (e.g. 8g, 512m), overriding the '
+             '"mem_limit" key (default: unlimited)',
+    )
+    parser.add_argument(
         "--ide", action="store_true",
         help="bridge the in-jail /ide to a code editor running on the host "
              "(off by default). Opens a channel from the sandbox to your editor "
@@ -184,6 +189,8 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
         parser.error("--claude-dir-base requires a non-empty value")
     if args.subnet == "":
         parser.error("--subnet requires a non-empty value")
+    if args.mem_limit == "":
+        parser.error("--mem-limit requires a non-empty value")
     rest = args.rest
     if rest and rest[0] in KNOWN_COMMANDS:
         args.command, cargs = rest[0], rest[1:]
@@ -574,7 +581,8 @@ def build_jail(user_flag: "str | None", config_path: str,
                claude_dir_base_flag: "str | None" = None,
                store_must_exist: bool = True,
                review_flag: bool = False,
-               cli_prompt_segments: "list | None" = None
+               cli_prompt_segments: "list | None" = None,
+               mem_limit_flag: "str | None" = None
                ) -> "tuple[dict, str, list[str], dict | None]":
     """Validate the config and assemble the launch environment and mount override.
 
@@ -590,7 +598,8 @@ def build_jail(user_flag: "str | None", config_path: str,
     (the --review CLI flag) forces that isolation on even when the config's
     `review` key is unset. `cli_prompt_segments` are the --system-prompt /
     --system-prompt-file values, appended to the merged prompt after the config's
-    own system_prompts and resolved by the same rules.
+    own system_prompts and resolved by the same rules. `mem_limit_flag` (the
+    --mem-limit flag) overrides the config's `mem_limit`.
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
@@ -724,7 +733,9 @@ def build_jail(user_flag: "str | None", config_path: str,
     # Pinned (the COMPOSE_PROFILES-style defensive pin) so an inherited JAIL_REVIEW
     # can't switch the entrypoint's git-review path on for a non-review run.
     environment["JAIL_REVIEW"] = "1" if review_ctx else ""
-    override, seeds = build_mounts.override(roots, config_class, review_ctx)
+    override, seeds = build_mounts.override(
+        roots, config_class, review_ctx,
+        build_env.service_lines(data, config_path, mem_limit_flag))
     return environment, override, seeds, review_ctx
 
 
@@ -893,7 +904,8 @@ def main() -> None:
     environment, override, seeds, review_ctx = build_jail(
         args.user, config_path, args.subnet, args.claude_dir_base,
         store_must_exist=launches, review_flag=args.review,
-        cli_prompt_segments=args.system_prompt_segments)
+        cli_prompt_segments=args.system_prompt_segments,
+        mem_limit_flag=args.mem_limit)
     # Review capture only works for a one-shot session: the launcher seeds the
     # spool, waits for the container, then adopts the bundle on teardown. A
     # persistent launch (up/start/watch) would prepare the gitdir but never

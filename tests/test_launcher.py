@@ -100,6 +100,15 @@ class ParseArgsTests(JailTestCase):
     def test_subnet_defaults_to_none(self):
         self.assertIsNone(L.parse_args(["-u", "me"]).subnet)
 
+    def test_mem_limit_flag(self):
+        self.assertEqual(L.parse_args(["--mem-limit", "8g"]).mem_limit, "8g")
+        self.assertIsNone(L.parse_args(["-u", "me"]).mem_limit)
+
+    def test_empty_mem_limit_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            L.parse_args(["--mem-limit", ""])
+
     def test_claude_dir_base_flag(self):
         args = L.parse_args(["--claude-dir-base", "/data/jh", "run", "-p", "hi"])
         self.assertEqual(args.claude_dir_base, "/data/jh")
@@ -709,6 +718,32 @@ class MainEnvSignalTests(JailTestCase):
         # even when the shell exported one.
         captured = self._run_main(["new"], preset={"COMPOSE_PROFILES": "ide"})
         self.assertEqual(captured["profiles"], "")
+
+
+class MemLimitBuildTests(JailTestCase):
+    """✦ build_jail renders mem_limit into the override, never the env."""
+
+    def _build(self, body, flag=None):
+        proj = self.tmpdir()
+        cfg = self.write(os.path.join(proj, ".claude-jail.json"), body)
+        env, override, _seeds, _ctx = L.build_jail(
+            None, cfg, None, self.tmpdir(), store_must_exist=True,
+            mem_limit_flag=flag)
+        return env, override
+
+    def test_unlimited_by_default(self):
+        _env, override = self._build('{"user": "t"}')
+        self.assertNotIn("mem_limit", override)
+
+    def test_config_key_rendered(self):
+        env, override = self._build('{"user": "t", "mem_limit": "8g"}')
+        self.assertIn("    mem_limit: 8g\n", override)
+        self.assertNotIn("8g", env.values())
+
+    def test_flag_overrides_config(self):
+        _env, override = self._build('{"user": "t", "mem_limit": "8g"}', "2g")
+        self.assertIn("    mem_limit: 2g\n", override)
+        self.assertNotIn("8g", override)
 
 
 class ReviewIsolationBuildTests(JailTestCase):

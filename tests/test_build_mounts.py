@@ -300,6 +300,17 @@ class OverrideTests(JailTestCase):
         # The absent active-config mask is scheduled for seeding.
         self.assertEqual(seeds, [f"{root}/{bm.CONFIG_NAME}"])
 
+    def test_service_lines_precede_volumes(self):
+        root = self.tmpdir()
+        document, _ = bm.override([Root(root, [], [])], None,
+                                  service_lines=["    mem_limit: 4g"])
+        self.assertTrue(document.startswith(
+            "services:\n  claude:\n    mem_limit: 4g\n    volumes:\n"))
+
+    def test_service_lines_alone_yield_document(self):
+        self.assertEqual(bm.override([], None, service_lines=["    mem_limit: 4g"]),
+                         ("services:\n  claude:\n    mem_limit: 4g\n", []))
+
     def test_git_default_read_only_skipped_when_absent(self):
         # .git is read_only by default; with no .git on disk it is just omitted.
         root = self.tmpdir()

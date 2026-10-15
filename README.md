@@ -56,7 +56,7 @@ operations:
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--ide] [--system-prompt <text>]... [--system-prompt-file <path>]... [COMMAND] [args...]
+claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--mem-limit <size>] [--ide] [--system-prompt <text>]... [--system-prompt-file <path>]... [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
@@ -70,6 +70,8 @@ claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subne
   Overrides the `claude_dir_base` config key; defaults to `$HOME`.
 - `--subnet <cidr>`: override the jail's internal Docker subnet (e.g.
   `10.123.45.0/24`). Must be a private (RFC1918) range, `/26` or larger.
+- `--mem-limit <size>`: cap the jail container's memory (e.g. `8g`, `512m`).
+  Overrides the `mem_limit` config key; unlimited by default.
 - `--ide`: bridge the in-jail `/ide` to a code editor running on the host.
   Off by default.
 - `--system-prompt <text>`: append an extra system prompt (inline literal text)
@@ -222,6 +224,10 @@ Available keys:
     a read-only empty file.
 - `default_mode`: the permission mode Claude starts in, forwarded to
   `claude --permission-mode`.
+- `mem_limit`: the jail container's memory cap: a positive integer with an
+  optional single-letter unit `b`, `k`, `m` or `g` (`"8g"`, `"512m"`, or a byte
+  count). Two-letter forms like `"8gb"` are rejected. Unlimited when absent. The
+  `--mem-limit` flag overrides it.
 - `egress`: the network egress policy, enforced by the Squid proxy (HTTP) and
   the Unbound resolver (DNS). An object:
   - `default`: `"deny"` (the default) or `"allow"`.

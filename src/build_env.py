@@ -4,7 +4,8 @@ build_mounts.py owns the filesystem keys (read_only / hidden); this module owns
 the rest of the config — the settings that shape how claude is launched.
 exports() returns the {NAME: value} mapping for the recognised settings (empty
 when none is set), which claude-jail sets in the environment and
-docker-compose.yml forwards into the container. Calls die() with a message on
+docker-compose.yml forwards into the container; service_lines() returns the
+settings rendered straight into the compose override instead. Calls die() with a message on
 stderr if the config is malformed or a value is invalid. Shared
 parsing/validation helpers live in jail_config.py.
 
@@ -15,8 +16,17 @@ Settings:
       which rejects an unknown one at startup and lists the choices, so we only
       check it is a bare word — both to keep this decoupled from claude's list
       and so the value is safe to export and interpolate without quoting.
+  mem_limit -> compose override `mem_limit:`
+      ✦ The agent container's memory cap, as docker's byte value: an integer
+      with an optional b/k/m/g suffix ("8g"). Unset means unlimited. The
+      --mem-limit flag overrides it. Not an env var, so nothing inherited from
+      the shell can set it.
 """
+import re
+
 from jail_config import BARE_WORD, die
+
+MEM_LIMIT = re.compile(r"\A[1-9][0-9]*[bkmg]?\Z", re.IGNORECASE)
 
 
 def default_mode(data: "dict", config_file: str) -> "str | None":
@@ -30,6 +40,22 @@ def default_mode(data: "dict", config_file: str) -> "str | None":
     return mode
 
 
+def mem_limit(data: "dict", config_file: str,
+              flag: "str | None" = None) -> "str | None":
+    """✦ The docker memory cap (--mem-limit, else mem_limit), or None."""
+    if flag is not None:
+        value, source = flag, "--mem-limit"
+    else:
+        value, source = data.get("mem_limit"), f"'mem_limit' in {config_file}"
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)) \
+            or not MEM_LIMIT.match(str(value)):
+        die(f"{source} must be a positive size like \"8g\" or \"512m\"; "
+            f"got {value!r}")
+    return str(value)
+
+
 def exports(data: "dict", config_file: str) -> "dict[str, str]":
     """The {NAME: value} env mapping for every recognised setting that is set."""
     # (env var, value) for each recognised setting; None means "not set".
@@ -37,3 +63,10 @@ def exports(data: "dict", config_file: str) -> "dict[str, str]":
         ("CLAUDE_JAIL_PERMISSION_MODE", default_mode(data, config_file)),
     ]
     return {name: value for name, value in settings if value is not None}
+
+
+def service_lines(data: "dict", config_file: str,
+                  mem_limit_flag: "str | None" = None) -> "list[str]":
+    """✦ The `claude` service keys for the compose override, indented to fit."""
+    mem = mem_limit(data, config_file, mem_limit_flag)
+    return [f"    mem_limit: {mem}"] if mem else []

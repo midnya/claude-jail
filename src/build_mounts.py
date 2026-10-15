@@ -453,7 +453,8 @@ def seed_masked_configs(paths: "list[str]") -> None:
 
 
 def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
-             isolation: "dict | None" = None
+             isolation: "dict | None" = None,
+             service_lines: "list[str] | None" = None
              ) -> "tuple[str, list[str]]":
     """Build the docker compose volume override: a per-root bind + masks.
 
@@ -469,6 +470,9 @@ def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
     of the read-only original) — and the host spool is bound so the session can
     drop its bundle for review. (The launcher passes its review context here, so
     extra keys like `masked`/`base` may ride along and are ignored.)
+
+    ✦ `service_lines` are extra pre-indented `claude` service keys
+    (build_env.service_lines), placed ahead of the volumes.
     """
     isolate_root = isolation["repo"] if isolation else None
     volumes: "list[str]" = []
@@ -493,8 +497,10 @@ def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
             volumes += _vcs_git_masks(root)
     if isolation:
         volumes += _spool_bind(isolation["spool"])
-    if not volumes:
+    service_lines = service_lines or []
+    if not volumes and not service_lines:
         return "", []
-    out: "list[str]" = ["services:", "  claude:", "    volumes:"]
-    out += volumes
+    out: "list[str]" = ["services:", "  claude:", *service_lines]
+    if volumes:
+        out += ["    volumes:", *volumes]
     return "\n".join(out) + "\n", seeds

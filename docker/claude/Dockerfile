@@ -18,27 +18,15 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     socat \
-    sudo \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Keep the build's proxy env across sudo, so the `sudo apt` steps below reach the
-# mirrors when this image is built behind the jail's egress proxy (the --dind
-# session builds the inner stack through squid; see docker/claude-jail-dind).
-# Without this, sudo's env_reset drops http(s)_proxy and apt can't resolve the
-# repos. A bare-host build sets no proxy, so this is a harmless no-op there.
-RUN printf 'Defaults env_keep += "http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY"\n' \
-        > /etc/sudoers.d/proxy && chmod 0440 /etc/sudoers.d/proxy
-
-RUN (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
-    && sudo mkdir -p -m 755 /etc/apt/keyrings \
-    && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    && cat $out | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && sudo apt update \
-    && sudo apt install gh -y \
+RUN mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d \
+    && wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
 ARG USER_UID=1000

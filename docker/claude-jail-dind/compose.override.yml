@@ -32,6 +32,9 @@ services:
     # privileged already grants /dev/fuse (and every other host device) via an
     # unrestricted device cgroup, so no explicit `devices:` entry is needed.
     privileged: true
+    # rootless dockerd needs the setuid newuidmap/newgidmap, which
+    # no-new-privileges neuters; privileged already overrides the base cap_drop.
+    security_opt: !reset []
     volumes:
       # The nested daemon's image store — a named volume so what it builds on the
       # first nested `run` persists across runs and stays off the overlay rootfs.

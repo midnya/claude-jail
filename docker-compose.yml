@@ -11,6 +11,10 @@ services:
         EXTRA_PIP_PACKAGES: ${JAIL_PIP_PACKAGES:-}
         EXTRA_NPM_PACKAGES: ${JAIL_NPM_PACKAGES:-}
 
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 4096 # Arbitrary, more than enough, but protects us from fork bombs.
+
     networks:
       - jail-internal
     dns:

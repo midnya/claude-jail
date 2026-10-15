@@ -10,8 +10,11 @@ Still in active development; bug reports, feature requests, and PRs are most wel
 
 ## AI usage disclosure
 
-`claude-jail` has partly been built with `Claude` itself; my time is, bluntly, better spent elsewhere.
-Its .git has always been quarantined.
+`claude-jail` has mostly been built with `Claude` itself; my time is, bluntly, better spent elsewhere.
+
+As it stands, **it is essentially slopware**. Maybe I'll spend the time to rewrite it properly, maybe not. The ever-evolving feature-set, a consequence of figuring out what this tool needs and wants, makes it unlikely in the near future.
+
+Its .git has always been quarantined. I trust it enough that the `claude` CLI is uninstalled from my host systems.
 
 **Use at your own risk.**
 

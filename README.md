@@ -31,6 +31,8 @@ operations:
       care must be taken that you don't give it access to its own repo, assuming it
       is hosted on GitHub.
         - The stated goal for including `gh` is for more-efficient read-only access to GitHub.
+        - There's one (1) guard against letting `gh` push to a protected .git.
+          There are so many more ways to bypass it. Please be careful.
   - For convenience, `/tmp` is a persisted volume that is shared per-workspace,
     between jail instances.
 - Network isolation: the jail container sits on an `internal` Docker network.
@@ -324,6 +326,14 @@ Notes:
 - The token is read on the host at launch and only ever reaches the container
   through its environment: nothing is written to the per-user store or `/tmp`.
   Anything running in the jail can read it, and it shows in `docker inspect`.
+- The launch is refused if the token can write to any github.com remote of any
+  root: the read-only `.git` only guards local history, and `Contents: write`
+  would let the agent push to or rewrite those repositories through GitHub. The
+  launcher checks each one from the host with a ref update that can never
+  succeed, and also refuses when GitHub's answer is inconclusive (bad token,
+  rate limit, network error). Other write permissions (pull requests,
+  workflows, issues) are currently not checked.
+    - **This is just a safeguard against one possible misconfig, not a security feature.**
 - The egress policy must allow `github.com` and `api.github.com`.
 
 ```sh

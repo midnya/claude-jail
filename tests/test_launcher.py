@@ -791,6 +791,26 @@ class GhTokenBuildTests(JailTestCase):
         _d, cfg = self._external(', "gh_token_file": "missing"')
         self.assertEqual(self._build(cfg, launches=False)["JAIL_GH_TOKEN"], "")
 
+    def test_launch_checks_remotes(self):
+        _d, cfg = self._external(', "gh_token_file": "tok"')
+        with mock.patch.object(L.build_env, "refuse_writable_remotes") as m:
+            self._build(cfg)
+        m.assert_called_once()
+        self.assertEqual(m.call_args.args[0], self.TOKEN)
+
+    def test_no_token_no_check(self):
+        _d, cfg = self._external()
+        with mock.patch.object(L.build_env, "refuse_writable_remotes") as m:
+            self._build(cfg)
+        m.assert_not_called()
+
+    def test_writable_token_refuses_launch(self):
+        _d, cfg = self._external(', "gh_token_file": "tok"')
+        with mock.patch.object(L.build_env, "refuse_writable_remotes",
+                               side_effect=SystemExit("Error: REFUSING")):
+            with self.assertDies("REFUSING"):
+                self._build(cfg)
+
 
 class ReviewIsolationBuildTests(JailTestCase):
     """build_jail wires git-review isolation into the env, override and ctx."""

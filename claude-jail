@@ -646,6 +646,9 @@ def build_jail(user_flag: "str | None", config_path: str,
     # logs volumes) so a differing policy never reuses another run's squid or dns.
     compose_project = f"{project}-{egress_id}"
     dns_subnet, dns_ip = dns_endpoint(compose_project, subnet)
+    gh_token = build_env.gh_token(data, config_path, config_dir(config_path),
+                                  config_class is not None, gh_token_flag,
+                                  read=store_must_exist)
     environment = {
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
@@ -680,11 +683,10 @@ def build_jail(user_flag: "str | None", config_path: str,
         **build_env.exports(data, config_path),
         # ✦ Always set, so a JAIL_GH_TOKEN inherited from the shell never reaches
         # the jail; read only for a launch.
-        "JAIL_GH_TOKEN": build_env.gh_token(
-            data, config_path, config_dir(config_path),
-            config_class is not None, gh_token_flag,
-            read=store_must_exist) or "",
+        "JAIL_GH_TOKEN": gh_token or "",
     }
+    if gh_token:
+        build_env.refuse_writable_remotes(gh_token, roots)
     # git-review isolation (opt-in): jail the config's own root dev-container
     # style — live working tree, .git shadowed by a throwaway clone of the
     # read-only original at /vcs/git — and route the session's commits back as a

@@ -36,7 +36,7 @@ from pathlib import Path
 
 from build_packages import Packages, empty
 from jail_config import (Root, config_dir, confine_to_roots, container_path,
-                         die, trusted_host_path)
+                         die, read_regular_file, trusted_host_path)
 
 SETTING = "system_prompts"
 
@@ -136,7 +136,7 @@ def resolve_segment(value: "object", source: str, cfg_dir: str,
         if not path.is_file():
             die(f"{source}: file not found: {rel}")
         try:
-            text = path.read_text(encoding="utf-8")
+            text = read_regular_file(path, f"{source}: {rel}")
         except (OSError, UnicodeDecodeError) as e:
             die(f"{source}: could not read file {rel}: {e}")
         if not text.strip():

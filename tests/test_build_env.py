@@ -122,6 +122,12 @@ class GhTokenTests(JailTestCase):
         with self.assertDies():
             be.gh_token({"gh_token_file": "link"}, "cfg", d, False)
 
+    def test_fifo_refused(self):
+        d = self.tmpdir()
+        os.mkfifo(os.path.join(d, "tok"))
+        with self.assertDies("regular file"):
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, False)
+
     def test_non_string_rejected(self):
         with self.assertDies("non-empty path"):
             be.gh_token({"gh_token_file": 3}, "cfg", self.tmpdir(), False)

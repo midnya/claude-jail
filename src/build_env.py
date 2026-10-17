@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from jail_config import BARE_WORD, die, trusted_host_path
+from jail_config import BARE_WORD, die, read_regular_file, trusted_host_path
 
 MEM_LIMIT = re.compile(r"\A[1-9][0-9]*[bkmg]?\Z", re.IGNORECASE)
 # ✦ Fine-grained PATs only; classic tokens (ghp_) can't be scoped per repository.
@@ -103,7 +103,7 @@ def gh_token(data: "dict", config_file: str, cfg_dir: str,
     rel = os.path.expanduser(rel)
     path = trusted_host_path(cfg_dir, rel, source)
     try:
-        token = path.read_text(encoding="utf-8").strip()
+        token = read_regular_file(path, f"{source}: {rel}").strip()
     except (OSError, UnicodeDecodeError) as e:
         die(f"{source}: could not read {rel}: {e}")
     if not GH_TOKEN.match(token):

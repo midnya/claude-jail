@@ -1,5 +1,7 @@
 """Tests for build_prompt.py: system_prompts resolution and prompt assembly."""
 import os
+from pathlib import Path
+from unittest import mock
 
 from jail_test_helpers import REPO_ROOT, JailTestCase  # noqa: I001 (puts src/ on sys.path)
 
@@ -51,6 +53,13 @@ class ResolveSegmentTests(JailTestCase):
         root = self.tmpdir()
         self.write(os.path.join(root, "p.md"), "ok\x00no")
         with self.assertDies("must not contain a NUL byte"):
+            self.seg({"path": "p.md"}, root)
+
+    def test_fifo_swapped_in_after_check_refused(self):
+        root = self.tmpdir()
+        os.mkfifo(os.path.join(root, "p.md"))
+        with mock.patch.object(Path, "is_file", return_value=True), \
+                self.assertDies("regular file"):
             self.seg({"path": "p.md"}, root)
 
     def test_bad_segment_type(self):

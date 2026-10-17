@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -336,6 +337,20 @@ def confine_to_roots(base_dir: str, rel: str, roots: "list[Root]",
     if not any(_inside(Path(r.dir), cur) for r in roots):
         die(f"{what} escapes the jail (resolves outside every root): {rel}")
     return cur
+
+
+def read_regular_file(path: "os.PathLike", what: str) -> str:
+    """✦ Read a UTF-8 file, dying unless it is a regular file.
+
+    O_NONBLOCK makes opening a FIFO return at once instead of hanging the
+    launch; fstat on the open fd then rejects it, so the file can't be swapped
+    for a FIFO between a check and the read.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding="utf-8") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            die(f"{what} must be a regular file")
+        return f.read()
 
 
 def trusted_host_path(base_dir: str, rel: str, what: str) -> Path:

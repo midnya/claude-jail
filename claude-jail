@@ -135,6 +135,13 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
              '"mem_limit" key (default: unlimited)',
     )
     parser.add_argument(
+        "--gh-token-file", metavar="PATH",
+        help="host file holding a fine-grained GitHub token (github_pat_...) "
+             "exposed to the in-jail gh CLI as GH_TOKEN, overriding the "
+             '"gh_token_file" key; resolved relative to the config file\'s '
+             "directory and never through a symlink",
+    )
+    parser.add_argument(
         "--ide", action="store_true",
         help="bridge the in-jail /ide to a code editor running on the host "
              "(off by default). Opens a channel from the sandbox to your editor "
@@ -191,6 +198,8 @@ def parse_args(argv: "list[str]") -> argparse.Namespace:
         parser.error("--subnet requires a non-empty value")
     if args.mem_limit == "":
         parser.error("--mem-limit requires a non-empty value")
+    if args.gh_token_file == "":
+        parser.error("--gh-token-file requires a non-empty value")
     rest = args.rest
     if rest and rest[0] in KNOWN_COMMANDS:
         args.command, cargs = rest[0], rest[1:]
@@ -582,7 +591,8 @@ def build_jail(user_flag: "str | None", config_path: str,
                store_must_exist: bool = True,
                review_flag: bool = False,
                cli_prompt_segments: "list | None" = None,
-               mem_limit_flag: "str | None" = None
+               mem_limit_flag: "str | None" = None,
+               gh_token_flag: "str | None" = None
                ) -> "tuple[dict, str, list[str], dict | None]":
     """Validate the config and assemble the launch environment and mount override.
 
@@ -599,7 +609,8 @@ def build_jail(user_flag: "str | None", config_path: str,
     `review` key is unset. `cli_prompt_segments` are the --system-prompt /
     --system-prompt-file values, appended to the merged prompt after the config's
     own system_prompts and resolved by the same rules. `mem_limit_flag` (the
-    --mem-limit flag) overrides the config's `mem_limit`.
+    --mem-limit flag) overrides the config's `mem_limit`. `gh_token_flag` (the
+    --gh-token-file flag) overrides the config's `gh_token_file`.
     """
     data = read_config(config_path)
     jail_user = resolve_user.resolve(data, user_flag, config_path)
@@ -667,6 +678,12 @@ def build_jail(user_flag: "str | None", config_path: str,
         "JAIL_NPM_PACKAGES": " ".join(packages.npm),
         "JAIL_IMAGE_SUFFIX": build_packages.image_suffix(packages, ids),
         **build_env.exports(data, config_path),
+        # ✦ Always set, so a JAIL_GH_TOKEN inherited from the shell never reaches
+        # the jail; read only for a launch.
+        "JAIL_GH_TOKEN": build_env.gh_token(
+            data, config_path, config_dir(config_path),
+            config_class is not None, gh_token_flag,
+            read=store_must_exist) or "",
     }
     # git-review isolation (opt-in): jail the config's own root dev-container
     # style — live working tree, .git shadowed by a throwaway clone of the
@@ -905,7 +922,7 @@ def main() -> None:
         args.user, config_path, args.subnet, args.claude_dir_base,
         store_must_exist=launches, review_flag=args.review,
         cli_prompt_segments=args.system_prompt_segments,
-        mem_limit_flag=args.mem_limit)
+        mem_limit_flag=args.mem_limit, gh_token_flag=args.gh_token_file)
     # Review capture only works for a one-shot session: the launcher seeds the
     # spool, waits for the container, then adopts the bundle on teardown. A
     # persistent launch (up/start/watch) would prepare the gitdir but never

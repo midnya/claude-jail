@@ -39,7 +39,7 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # hard error, instead of a jail that quietly drops the protections they meant.
 TOP_LEVEL_KEYS = {"user", "uid", "gid", "default_mode", "mem_limit",
                   "system_prompts", "roots", "egress", "packages",
-                  "claude_dir_base", "review"}
+                  "claude_dir_base", "review", "gh_token_file"}
 
 
 def review_enabled(data: "dict", config_file: str) -> bool:

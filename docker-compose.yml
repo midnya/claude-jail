@@ -39,6 +39,7 @@ services:
       CLAUDE_JAIL_PERMISSION_MODE: ${CLAUDE_JAIL_PERMISSION_MODE:-}
       CLAUDE_JAIL_NEW_SESSION: ${CLAUDE_JAIL_NEW_SESSION:-}
       CLAUDE_CODE_IDE_HOST_OVERRIDE:
+      GH_TOKEN: ${JAIL_GH_TOKEN:-}
 
       # e2e test seam. CLAUDE_JAIL_AGENT_CMD overrides the agent binary, but the
       # entrypoint honours it only when CLAUDE_JAIL_E2E is "1" — both are pinned

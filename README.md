@@ -27,6 +27,10 @@ operations:
   - VCS directories are read-only by default.
     - Opt-in "review" mode where modifications to .git are bundled
       after container's teardown and available for human review.
+    - `gh` is bundled in the jail by default, but without credentials. If adding any,
+      care must be taken that you don't give it access to its own repo, assuming it
+      is hosted on GitHub.
+        - The stated goal for including `gh` is for more-efficient read-only access to GitHub.
   - For convenience, `/tmp` is a persisted volume that is shared per-workspace,
     between jail instances.
 - Network isolation: the jail container sits on an `internal` Docker network.
@@ -56,7 +60,7 @@ operations:
 Everything goes through `claude-jail`:
 
 ```sh
-claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--mem-limit <size>] [--ide] [--system-prompt <text>]... [--system-prompt-file <path>]... [COMMAND] [args...]
+claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subnet <cidr>] [--mem-limit <size>] [--gh-token-file <path>] [--ide] [--system-prompt <text>]... [--system-prompt-file <path>]... [COMMAND] [args...]
 ```
 
 - `--user <name>` (`-u`): a config namespace. Claude's config and credentials
@@ -72,6 +76,10 @@ claude-jail [--user <name>] [--config <path>] [--claude-dir-base <dir>] [--subne
   `10.123.45.0/24`). Must be a private (RFC1918) range, `/26` or larger.
 - `--mem-limit <size>`: cap the jail container's memory (e.g. `8g`, `512m`).
   Overrides the `mem_limit` config key; unlimited by default.
+- `--gh-token-file <path>`: a host file holding one fine-grained GitHub token
+  (`github_pat_...`), passed to the in-jail `gh` CLI as `GH_TOKEN`. Overrides the
+  `gh_token_file` config key. Resolved like `--system-prompt-file`. See
+  [GitHub CLI](#github-cli).
 - `--ide`: bridge the in-jail `/ide` to a code editor running on the host.
   Off by default.
 - `--system-prompt <text>`: append an extra system prompt (inline literal text)
@@ -228,6 +236,9 @@ Available keys:
   optional single-letter unit `b`, `k`, `m` or `g` (`"8g"`, `"512m"`, or a byte
   count). Two-letter forms like `"8gb"` are rejected. Unlimited when absent. The
   `--mem-limit` flag overrides it.
+- `gh_token_file`: the path of a host file holding the project's GitHub token, as
+  for `--gh-token-file` (which overrides it). Refused when the config lives inside
+  the jail; set it in an external `--config` or pass the flag.
 - `egress`: the network egress policy, enforced by the Squid proxy (HTTP) and
   the Unbound resolver (DNS). An object:
   - `default`: `"deny"` (the default) or `"allow"`.
@@ -301,6 +312,23 @@ Notes:
 - A missing `read_only` path is skipped; a missing `hidden` path is a hard error.
 - A missing or empty `system_prompts.path` file is a hard error.
 - An explicit `--permission-mode` on the command line wins.
+
+### GitHub CLI
+
+`gh` has no persisted login in the jail. Each session gets its credentials from
+`--gh-token-file` (or `gh_token_file`):
+
+- Use a [fine-grained token](https://github.com/settings/personal-access-tokens)
+  limited to the repositories and permissions the session needs. Classic tokens
+  (`ghp_...`) are rejected.
+- The token is read on the host at launch and only ever reaches the container
+  through its environment: nothing is written to the per-user store or `/tmp`.
+  Anything running in the jail can read it, and it shows in `docker inspect`.
+- The egress policy must allow `github.com` and `api.github.com`.
+
+```sh
+claude-jail --gh-token-file ~/.config/claude-jail/tokens/myproject
+```
 
 ## "Why `claude-jail` instead of OpenShell?"
 

@@ -1,7 +1,13 @@
-"""Tests for build_env.py: the non-filesystem settings (default_mode, mem_limit)."""
+"""Tests for build_env.py: the non-filesystem settings (default_mode, mem_limit,
+gh_token_file)."""
 from jail_test_helpers import JailTestCase  # noqa: I001 (puts src/ on sys.path)
 
+import os
+from unittest import mock
+
 import build_env as be
+
+TOKEN = "github_pat_11ABCDEFG0abcdefghij_0123456789"
 
 
 class DefaultModeTests(JailTestCase):
@@ -51,6 +57,75 @@ class MemLimitTests(JailTestCase):
     def test_unknown_unit_rejected(self):
         with self.assertDies("must be a positive size"):
             be.mem_limit({"mem_limit": "8gb"}, "cfg")
+
+
+class GhTokenTests(JailTestCase):
+    def _token_file(self, text=TOKEN + "\n"):
+        d = self.tmpdir()
+        return d, self.write(os.path.join(d, "tok"), text)
+
+    def test_absent_is_none(self):
+        self.assertIsNone(be.gh_token({}, "cfg", self.tmpdir(), False))
+
+    def test_config_key_read_and_stripped(self):
+        d, _f = self._token_file()
+        self.assertEqual(
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, False), TOKEN)
+
+    def test_config_key_expands_tilde(self):
+        d, _f = self._token_file()
+        with mock.patch.dict(os.environ, {"HOME": d}):
+            self.assertEqual(be.gh_token({"gh_token_file": "~/tok"}, "cfg",
+                                         self.tmpdir(), False), TOKEN)
+
+    def test_flag_overrides_config(self):
+        d, f = self._token_file()
+        self.assertEqual(be.gh_token({"gh_token_file": "missing"}, "cfg", d,
+                                     False, flag=f), TOKEN)
+
+    def test_in_jail_config_key_refused(self):
+        d, _f = self._token_file()
+        with self.assertDies("is refused"):
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, True)
+
+    def test_in_jail_refused_even_with_flag(self):
+        d, f = self._token_file()
+        with self.assertDies("is refused"):
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, True, flag=f)
+
+    def test_flag_allowed_with_in_jail_config(self):
+        d, f = self._token_file()
+        self.assertEqual(be.gh_token({}, "cfg", d, True, flag=f), TOKEN)
+
+    def test_classic_token_rejected(self):
+        d, _f = self._token_file("ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+        with self.assertDies("fine-grained"):
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, False)
+
+    def test_multiple_tokens_rejected(self):
+        d, _f = self._token_file(TOKEN + "\n" + TOKEN)
+        with self.assertDies("exactly one"):
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, False)
+
+    def test_rejection_does_not_echo_contents(self):
+        d, _f = self._token_file("not-a-token-secret")
+        with self.assertRaises(SystemExit) as cm:
+            be.gh_token({"gh_token_file": "tok"}, "cfg", d, False)
+        self.assertNotIn("not-a-token-secret", str(cm.exception.code))
+
+    def test_symlink_refused(self):
+        d, f = self._token_file()
+        self.symlink(os.path.join(d, "link"), f)
+        with self.assertDies():
+            be.gh_token({"gh_token_file": "link"}, "cfg", d, False)
+
+    def test_non_string_rejected(self):
+        with self.assertDies("non-empty path"):
+            be.gh_token({"gh_token_file": 3}, "cfg", self.tmpdir(), False)
+
+    def test_no_read_skips_file(self):
+        self.assertIsNone(be.gh_token({"gh_token_file": "missing"}, "cfg",
+                                      self.tmpdir(), False, read=False))
 
 
 class ExportsTests(JailTestCase):

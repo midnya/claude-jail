@@ -746,6 +746,52 @@ class MemLimitBuildTests(JailTestCase):
         self.assertNotIn("8g", override)
 
 
+class GhTokenBuildTests(JailTestCase):
+    """✦ build_jail exports the token as JAIL_GH_TOKEN, pinned to "" when unset."""
+
+    TOKEN = "github_pat_11ABCDEFG0abcdefghij_0123456789"
+
+    def _external(self, body_extra=""):
+        proj = self.tmpdir()
+        cfg_dir = self.tmpdir()
+        self.write(os.path.join(cfg_dir, "tok"), self.TOKEN)
+        cfg = self.write(os.path.join(cfg_dir, "jail.json"),
+                         f'{{"user": "t", "roots": ["{proj}"]{body_extra}}}')
+        return cfg_dir, cfg
+
+    def _build(self, cfg, flag=None, launches=True):
+        env, _o, _s, _c = L.build_jail(None, cfg, None, self.tmpdir(),
+                                       store_must_exist=launches,
+                                       gh_token_flag=flag)
+        return env
+
+    def test_unset_pins_empty(self):
+        _d, cfg = self._external()
+        with mock.patch.dict(L.os.environ, {"JAIL_GH_TOKEN": "x"}, clear=False):
+            self.assertEqual(self._build(cfg)["JAIL_GH_TOKEN"], "")
+
+    def test_external_config_key(self):
+        _d, cfg = self._external(', "gh_token_file": "tok"')
+        self.assertEqual(self._build(cfg)["JAIL_GH_TOKEN"], self.TOKEN)
+
+    def test_flag(self):
+        d, cfg = self._external()
+        self.assertEqual(self._build(cfg, os.path.join(d, "tok"))["JAIL_GH_TOKEN"],
+                         self.TOKEN)
+
+    def test_in_jail_config_key_refused(self):
+        proj = self.tmpdir()
+        self.write(os.path.join(proj, "tok"), self.TOKEN)
+        cfg = self.write(os.path.join(proj, ".claude-jail.json"),
+                         '{"user": "t", "gh_token_file": "tok"}')
+        with self.assertDies("is refused"):
+            self._build(cfg)
+
+    def test_non_launch_does_not_read(self):
+        _d, cfg = self._external(', "gh_token_file": "missing"')
+        self.assertEqual(self._build(cfg, launches=False)["JAIL_GH_TOKEN"], "")
+
+
 class ReviewIsolationBuildTests(JailTestCase):
     """build_jail wires git-review isolation into the env, override and ctx."""
 

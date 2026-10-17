@@ -649,6 +649,8 @@ def build_jail(user_flag: "str | None", config_path: str,
     gh_token = build_env.gh_token(data, config_path, config_dir(config_path),
                                   config_class is not None, gh_token_flag,
                                   read=store_must_exist)
+    warn_ssh_aliases = build_env.ssh_alias_warning(data, config_path,
+                                                   config_class is not None)
     environment = {
         "JAIL_ID": jail_id,
         "JAIL_USER": jail_user,
@@ -686,7 +688,7 @@ def build_jail(user_flag: "str | None", config_path: str,
         "JAIL_GH_TOKEN": gh_token or "",
     }
     if gh_token:
-        build_env.refuse_writable_remotes(gh_token, roots)
+        build_env.refuse_writable_remotes(gh_token, roots, warn_ssh_aliases)
     # git-review isolation (opt-in): jail the config's own root dev-container
     # style — live working tree, .git shadowed by a throwaway clone of the
     # read-only original at /vcs/git — and route the session's commits back as a

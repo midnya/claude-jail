@@ -241,6 +241,10 @@ Available keys:
 - `gh_token_file`: the path of a host file holding the project's GitHub token, as
   for `--gh-token-file` (which overrides it). Refused when the config lives inside
   the jail; set it in an external `--config` or pass the flag.
+- `gh_warn_ssh_aliases`: `false` silences the launch warning about ssh remotes
+  that aren't on github.com (see [GitHub CLI](#github-cli)); the write check
+  is unchanged. Defaults to `true`. `false` is refused when the config lives
+  inside the jail.
 - `egress`: the network egress policy, enforced by the Squid proxy (HTTP) and
   the Unbound resolver (DNS). An object:
   - `default`: `"deny"` (the default) or `"allow"`.
@@ -326,14 +330,20 @@ Notes:
 - The token is read on the host at launch and only ever reaches the container
   through its environment: nothing is written to the per-user store or `/tmp`.
   Anything running in the jail can read it, and it shows in `docker inspect`.
-- The launch is refused if the token can write to any github.com remote of any
-  root: the read-only `.git` only guards local history, and `Contents: write`
-  would let the agent push to or rewrite those repositories through GitHub. The
-  launcher checks each one from the host with a ref update that can never
-  succeed, and also refuses when GitHub's answer is inconclusive (bad token,
-  rate limit, network error). Other write permissions (pull requests,
-  workflows, issues) are currently not checked.
-    - **This is just a safeguard against one possible misconfig, not a security feature.**
+- The launch is refused if the token can write to any github.com remote of the
+  repo each root is in (and of every repo around that one): the read-only `.git`
+  only guards local history, and `Contents: write` would let the agent push to
+  or rewrite those repositories through GitHub. The launcher checks each one
+  from the host with a ref update that can never succeed, and also refuses when
+  GitHub's answer is inconclusive (bad token, rate limit, network error). Other
+  write permissions (pull requests, workflows, issues) are currently not checked.
+  - Repos *inside* a root (a root like `~/gits` that isn't itself in a repo, or
+    a repo's submodules) are not looked for, so their remotes are not checked.
+  - An ssh remote on any host other than github.com is not checked either:
+    git doesn't expand `~/.ssh/config` aliases, so `github-work:o/r` can't be
+    told apart from a non-GitHub host. The launch warns about each one; set
+    `gh_warn_ssh_aliases` to `false` to silence the warning.
+  - **This is just a safeguard against one possible misconfig, not a security feature.**
 - The egress policy must allow `github.com` and `api.github.com`.
 
 ```sh

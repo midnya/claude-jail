@@ -40,7 +40,8 @@ ROOT_KEYS = {"path", "read_only", "hidden"}
 # hard error, instead of a jail that quietly drops the protections they meant.
 TOP_LEVEL_KEYS = {"user", "uid", "gid", "default_mode", "mem_limit",
                   "system_prompts", "roots", "egress", "packages",
-                  "claude_dir_base", "review", "gh_token_file"}
+                  "claude_dir_base", "review", "gh_token_file",
+                  "gh_warn_ssh_aliases"}
 
 
 def review_enabled(data: "dict", config_file: str) -> bool:
@@ -359,7 +360,17 @@ def trusted_host_path(base_dir: str, rel: str, what: str) -> Path:
     For a `--config` the user keeps outside the jail the file is trusted and may
     live anywhere (an absolute `rel` is taken as-is); a symlink is still refused,
     so an in-root file the agent controls cannot redirect the read.
+
+    ✦ $HOME and its ancestors are the user's own, so a path under $HOME walks
+    from its real location: a symlinked /home (Fedora Atomic's /home ->
+    /var/home) doesn't refuse every `~/...` path.
     """
+    home = os.environ.get("HOME")
+    if home and os.path.isabs(rel) and os.path.isabs(home):
+        home = os.path.normpath(home)
+        sub = os.path.relpath(os.path.normpath(rel), home)
+        if sub != ".." and not sub.startswith("../"):
+            return _walk_no_symlink(os.path.realpath(home), sub, what)
     return _walk_no_symlink(base_dir, rel, what)
 
 

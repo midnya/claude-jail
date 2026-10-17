@@ -28,10 +28,15 @@ Settings:
       its path could aim the read at any host file. The --gh-token-file flag
       overrides it. refuse_writable_remotes() then refuses the launch when the
       token can write to any GitHub remote of a jail root.
+  gh_warn_ssh_aliases -> launcher only
+      ✦ Default true. False silences the warning about ssh remotes whose host
+      isn't github.com (possibly an unexpanded ~/.ssh/config alias); the write
+      check itself is unchanged. false is refused from an in-jail config.
 """
 import os
 import re
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +50,7 @@ GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 GITHUB_REPO = re.compile(r"\A/?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?\Z")
 # git's scp-like syntax ([user@]host:path) applies only with no slash before the colon.
 SCP_URL = re.compile(r"\A(?:[^@/:]+@)?([^/:]+):(.*)\Z")
+SSH_SCHEMES = frozenset({"ssh", "git+ssh", "ssh+git"})
 GITHUB_API = "https://api.github.com"
 PROBE_REF = "heads/claude-jail-write-probe"
 REDIRECTS = frozenset({301, 302, 303, 307, 308})
@@ -112,50 +118,84 @@ def gh_token(data: "dict", config_file: str, cfg_dir: str,
     return token
 
 
-def remote_urls(root_dir: str) -> "list[tuple[str, str]]":
-    """✦ (remote name, url) for every fetch and push url of the repo at root_dir.
+def remote_urls(root_dir: str) -> "list[tuple[str, str, str]]":
+    """✦ (repo dir, remote name, url) for every fetch and push url of every repo
+    enclosing root_dir.
 
-    `git remote get-url` applies `url.*.insteadOf`, so these are the urls git
-    really talks to. A root that isn't in a git repo has none; any other git
-    failure dies rather than silently skipping the check.
+    Walks up from root_dir's real path and asks each `.git` found along the way
+    for its remotes, so a `.git` the agent creates inside a root can't hide the
+    real repo's remotes from the next launch. The walk is on the filesystem, not
+    git's discovery, since a planted repo's config (core.worktree) would steer
+    that. Repos nested below root_dir aren't looked for. `git remote get-url`
+    applies `url.*.insteadOf`, so these are the urls git really talks to. Any git
+    failure other than "not a git repository" dies rather than silently skipping
+    the check.
     """
-    def git(*args):
+    def git(git_dir, *args):
         try:
-            r = subprocess.run(["git", "-C", root_dir, *args], capture_output=True,
-                               text=True, env={**os.environ, "LC_ALL": "C"})
+            r = subprocess.run(["git", f"--git-dir={git_dir}", *args],
+                               capture_output=True, text=True,
+                               env={**os.environ, "LC_ALL": "C"})
         except OSError as e:
             die(f"--gh-token-file needs git to check {root_dir}'s remotes: {e}")
         if r.returncode != 0:
             if "not a git repository" in r.stderr:
                 return None
-            die(f"could not list the git remotes of {root_dir}: {r.stderr.strip()}")
+            die(f"could not list the git remotes of {git_dir}: {r.stderr.strip()}")
         return r.stdout.splitlines()
 
-    names = git("remote")
-    if names is None:
-        return []
-    return [(name, url) for name in names
-            for push in ([], ["--push"])
-            for url in git("remote", "get-url", *push, "--all", name) or []]
+    urls, cur = [], os.path.realpath(root_dir)
+    while True:
+        git_dir = os.path.join(cur, ".git")
+        if os.path.lexists(git_dir):
+            urls += [(cur, name, url) for name in git(git_dir, "remote") or []
+                     for push in ([], ["--push"])
+                     for url in git(git_dir, "remote", "get-url", *push,
+                                    "--all", name) or []]
+        if (parent := os.path.dirname(cur)) == cur:
+            return urls
+        cur = parent
+
+
+def _host_path(url: str) -> "tuple[str | None, str, bool] | None":
+    """✦ (host, path, is_ssh) of a remote url, or None for a local path."""
+    if "://" in url:
+        parts = urllib.parse.urlsplit(url)
+        return parts.hostname, parts.path, parts.scheme.lower() in SSH_SCHEMES
+    m = SCP_URL.match(url)
+    return (m[1], m[2], True) if m else None
 
 
 def github_repo(url: str, where: str) -> "str | None":
     """✦ The "owner/repo" a github.com remote url names, or None if not GitHub."""
-    if "://" in url:
-        parts = urllib.parse.urlsplit(url)
-        host, path = parts.hostname, parts.path
-    else:
-        m = SCP_URL.match(url)
-        if not m:
-            return None
-        host, path = m[1], m[2]
-    if (host or "").lower() not in GITHUB_HOSTS:
+    hp = _host_path(url)
+    if hp is None or (hp[0] or "").lower() not in GITHUB_HOSTS:
         return None
-    m = GITHUB_REPO.match(path)
+    m = GITHUB_REPO.match(hp[1])
     if not m:
         # The url itself may embed credentials, so name the remote, not the url.
         die(f"{where} is on GitHub but its owner/repo could not be parsed")
     return f"{m[1]}/{m[2]}"
+
+
+def ssh_alias_warning(data: "dict", config_file: str,
+                      config_in_jail: bool) -> bool:
+    """✦ Whether to warn about ssh remotes not on github.com (the
+    gh_warn_ssh_aliases key, default on).
+
+    false is refused from an in-jail config: the agent would otherwise silence
+    the warning about the hole it is using.
+    """
+    value = data.get("gh_warn_ssh_aliases")
+    source = f"'gh_warn_ssh_aliases' in {config_file}"
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        die(f"{source} must be true or false")
+    if config_in_jail and not value:
+        die(f"{source} is refused: the config is inside the jail; set it in an "
+            "external --config")
+    return value
 
 
 def _probe_write(repo: str, token: str) -> "tuple[int, dict]":
@@ -191,20 +231,38 @@ def _probe_write(repo: str, token: str) -> "tuple[int, dict]":
     return status, headers
 
 
-def refuse_writable_remotes(token: str, roots: "list") -> None:
+def refuse_writable_remotes(token: str, roots: "list",
+                            warn_ssh_aliases: bool = True) -> None:
     """✦ Die, loudly, if `token` can write to any GitHub remote of `roots`.
 
     The read-only .git only guards local history: a token with Contents:write lets
     the agent push to (or rewrite) the jail's own repos from inside. Fails closed:
     anything but a clear yes/no from GitHub also refuses the launch.
+
+    An ssh remote on another host may be an ~/.ssh/config alias for github.com,
+    which git doesn't expand, so it is warned about (unless warn_ssh_aliases is
+    off) rather than probed.
     """
-    repos = {}
+    repos, aliases = {}, {}
     for root in roots:
-        for name, url in remote_urls(root.dir):
-            where = f"{root.dir}: remote '{name}'"
+        for top, name, url in remote_urls(root.dir):
+            where = f"{top}: remote '{name}'"
             repo = github_repo(url, where)
             if repo:
                 repos.setdefault(repo.lower(), (repo, where))
+                continue
+            hp = _host_path(url)
+            if hp and hp[2] and hp[0]:
+                aliases.setdefault((where, hp[0]), None)
+    if warn_ssh_aliases and aliases:
+        print("\n".join([
+            "claude-jail: WARNING: these ssh remotes aren't on github.com, so",
+            "the GitHub token's write check skipped them. If a host is an",
+            "~/.ssh/config alias for github.com, make sure the token can't write",
+            "to that repo:",
+            *(f"  {host}  ({where})" for where, host in aliases),
+            "Set \"gh_warn_ssh_aliases\": false in the config to silence this."]),
+              file=sys.stderr)
     writable = []
     for repo, where in repos.values():
         try:

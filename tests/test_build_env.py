@@ -122,6 +122,22 @@ class GhTokenTests(JailTestCase):
         with self.assertDies():
             be.gh_token({"gh_token_file": "link"}, "cfg", d, False)
 
+    def test_symlinked_home_ancestor_allowed(self):
+        d, _f = self._token_file()
+        link = os.path.join(self.tmpdir(), "home")
+        self.symlink(link, d)
+        with mock.patch.dict(os.environ, {"HOME": link}):
+            self.assertEqual(be.gh_token({"gh_token_file": "~/tok"}, "cfg",
+                                         self.tmpdir(), False), TOKEN)
+
+    def test_symlink_under_home_still_refused(self):
+        d, f = self._token_file()
+        self.symlink(os.path.join(d, "link"), f)
+        with mock.patch.dict(os.environ, {"HOME": d}):
+            with self.assertDies("symlink"):
+                be.gh_token({"gh_token_file": "~/link"}, "cfg", self.tmpdir(),
+                            False)
+
     def test_fifo_refused(self):
         d = self.tmpdir()
         os.mkfifo(os.path.join(d, "tok"))
@@ -135,6 +151,27 @@ class GhTokenTests(JailTestCase):
     def test_no_read_skips_file(self):
         self.assertIsNone(be.gh_token({"gh_token_file": "missing"}, "cfg",
                                       self.tmpdir(), False, read=False))
+
+
+class SshAliasWarningTests(JailTestCase):
+    def test_default_on(self):
+        self.assertTrue(be.ssh_alias_warning({}, "cfg", True))
+
+    def test_off(self):
+        self.assertFalse(be.ssh_alias_warning(
+            {"gh_warn_ssh_aliases": False}, "cfg", False))
+
+    def test_non_bool_rejected(self):
+        with self.assertDies("true or false"):
+            be.ssh_alias_warning({"gh_warn_ssh_aliases": "no"}, "cfg", False)
+
+    def test_in_jail_config_false_refused(self):
+        with self.assertDies("is refused"):
+            be.ssh_alias_warning({"gh_warn_ssh_aliases": False}, "cfg", True)
+
+    def test_in_jail_config_true_allowed(self):
+        self.assertTrue(be.ssh_alias_warning(
+            {"gh_warn_ssh_aliases": True}, "cfg", True))
 
 
 # Isolates the test repos from the host's git config (insteadOf rules etc.).
@@ -166,19 +203,39 @@ class RemoteUrlsTests(GitRepoCase):
         d = self.repo(origin="git@github.com:o/r.git")
         self.git(d, "remote", "set-url", "--push", "origin",
                  "https://github.com/o/push.git")
+        top = os.path.realpath(d)
         self.assertEqual(be.remote_urls(d), [
-            ("origin", "git@github.com:o/r.git"),
-            ("origin", "https://github.com/o/push.git")])
+            (top, "origin", "git@github.com:o/r.git"),
+            (top, "origin", "https://github.com/o/push.git")])
 
     def test_insteadof_applied(self):
         d = self.repo(origin="gh:o/r")
         self.git(d, "config", "url.https://github.com/.insteadOf", "gh:")
-        self.assertIn(("origin", "https://github.com/o/r"), be.remote_urls(d))
+        self.assertIn((os.path.realpath(d), "origin", "https://github.com/o/r"),
+                      be.remote_urls(d))
 
     def test_subdirectory_of_repo(self):
         d = self.repo(origin="git@github.com:o/r.git")
         sub = self.mkdir(os.path.join(d, "sub"))
-        self.assertIn(("origin", "git@github.com:o/r.git"), be.remote_urls(sub))
+        self.assertIn((os.path.realpath(d), "origin", "git@github.com:o/r.git"),
+                      be.remote_urls(sub))
+
+    def test_planted_worktree_does_not_steer_climb(self):
+        d = self.repo(origin="git@github.com:o/r.git")
+        sub = self.mkdir(os.path.join(d, "sub"))
+        self.git(sub, "init", "-q")
+        for wt in (self.repo(), self.mkdir(os.path.join(sub, "x")), "/"):
+            with self.subTest(worktree=wt):
+                self.git(sub, "config", "core.worktree", wt)
+                self.assertIn("git@github.com:o/r.git",
+                              {u for _t, _n, u in be.remote_urls(sub)})
+
+    def test_planted_repo_does_not_hide_enclosing_one(self):
+        d = self.repo(origin="git@github.com:o/r.git")
+        sub = self.mkdir(os.path.join(d, "sub"))
+        self.git(sub, "init", "-q")
+        self.assertEqual({u for _t, _n, u in be.remote_urls(sub)},
+                         {"git@github.com:o/r.git"})
 
 
 class GithubRepoTests(JailTestCase):
@@ -202,6 +259,9 @@ class GithubRepoTests(JailTestCase):
                     "https://github.com.evil.example/o/r"):
             with self.subTest(url=url):
                 self.assertIsNone(be.github_repo(url, "w"))
+
+    def test_ssh_alias_is_not_github(self):
+        self.assertIsNone(be.github_repo("github-work:o/r.git", "w"))
 
     def test_unparseable_github_dies_without_echoing_url(self):
         with self.assertRaises(SystemExit) as cm:
@@ -272,6 +332,31 @@ class RefuseWritableRemotesTests(GitRepoCase):
                                side_effect=OSError("unreachable")):
             with self.assertDies("unreachable", "refusing to start"):
                 be.refuse_writable_remotes(TOKEN, self.roots(d))
+
+    def _stderr_of(self, *dirs, warn=True):
+        with mock.patch.object(be, "_probe_write", return_value=(403, {})), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            be.refuse_writable_remotes(TOKEN, self.roots(*dirs), warn)
+        return err.getvalue()
+
+    def test_ssh_alias_warned_not_probed(self):
+        d = self.repo(origin="git@github-work:o/r.git",
+                      up="ssh://git@gh-alt/o/r", web="https://gitlab.com/o/r")
+        err = self._stderr_of(d)
+        self.assertIn("github-work", err)
+        self.assertIn("gh-alt", err)
+        self.assertNotIn("gitlab", err)
+
+    def test_every_alias_of_a_remote_named(self):
+        d = self.repo(origin="git@gh-a:o/r.git")
+        self.git(d, "remote", "set-url", "--push", "origin", "git@gh-b:o/x.git")
+        err = self._stderr_of(d)
+        self.assertIn("gh-a", err)
+        self.assertIn("gh-b", err)
+
+    def test_ssh_alias_warning_can_be_silenced(self):
+        d = self.repo(origin="git@github-work:o/r.git")
+        self.assertEqual(self._stderr_of(d, warn=False), "")
 
     def test_message_never_holds_token(self):
         d = self.repo(origin="git@github.com:o/r.git")

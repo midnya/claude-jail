@@ -1,5 +1,20 @@
 # claude-jail
 
+2026/10/19: Today, I successfully fired my last two remaining synapses, and understood how "Claude Connectors" work.
+ - This is all a mess. What even is going on here. Why are we doing this.
+ - Is this the future? All of our API calls inspected by the thing we offloaded our brains to?
+ - The various MCP mechanisms and tooling can bypass so many of the protections.
+ - I need time to figure things out in detail.
+
+e.g., as of writing, I can't prevent the following:
+ - the `claude` binary makes an HTTP call to `claude.com` (needed for... claude to work).
+ - that call is "Do something with the Atlassian Connector".
+ - that something is "Write `%content%` to the .git repository that is being `claude-jail`ed".
+
+tl;dr: as of today, the potential blast radius is as large as the organization's Connectors.
+
+---
+
 Run Claude Code inside a locked-down Docker container.
 
 Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).

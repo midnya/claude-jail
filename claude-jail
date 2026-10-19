@@ -661,7 +661,6 @@ def build_jail(user_flag: "str | None", config_path: str,
         "JAIL_WORKDIR": workdir,
         "COMPOSE_PROJECT_NAME": compose_project,
         "JAIL_EGRESS_ID": egress_id,
-        "CLAUDE_APPEND_SYSTEM_PROMPT": prompt,
         "JAIL_SQUID_ACL": squid_acl,
         # The DNS allowlist (same policy, L3) plus the resolver's fixed address
         # and the internal subnet that address requires.
@@ -756,7 +755,7 @@ def build_jail(user_flag: "str | None", config_path: str,
     environment["JAIL_REVIEW"] = "1" if review_ctx else ""
     override, seeds = build_mounts.override(
         roots, config_class, review_ctx,
-        build_env.service_lines(data, config_path, mem_limit_flag))
+        build_env.service_lines(data, config_path, mem_limit_flag), prompt)
     return environment, override, seeds, review_ctx
 
 

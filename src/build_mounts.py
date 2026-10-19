@@ -1,4 +1,4 @@
-"""Build the docker compose override (volumes) for a claude-jail run.
+"""Build the docker compose override (volumes, prompt) for a claude-jail run.
 
 Owns the filesystem keys of .claude-jail.json (the per-root read_only / hidden
 lists); the roots themselves are parsed by jail_config.py and the rest of the
@@ -20,6 +20,7 @@ mask file lives outside the jail roots, so the sandboxed agent has no writable
 path to it and cannot un-empty the masks.
 """
 import json
+import re
 from pathlib import Path, PurePosixPath
 
 from jail_config import (Root, container_path, die, names_root_itself,
@@ -231,23 +232,43 @@ def ensure_empty_mask() -> None:
         die(f"could not create mask file {path}: {e}")
 
 
-def _yaml_path(value: str) -> str:
-    """A host/container path as a YAML scalar for the override document.
+# ✦ Characters json.dumps leaves raw that YAML refuses in a double-quoted scalar,
+# or folds to a space as line breaks (NEL, LS, PS).
+_YAML_NONPRINTABLE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 
-    json.dumps gives a safely-quoted string (handles spaces, quotes, control
-    chars); doubling `$` to `$$` stops docker compose from interpolating a
-    literal dollar in the path — compose interpolates every -f file it merges
-    (the piped override included) and `$$` is its escape for a literal `$`.
+
+def _yaml_scalar(value: str) -> str:
+    """✦ A path or free text as a double-quoted YAML scalar for the override document.
+
+    json.dumps quotes it and escapes C0 controls; _YAML_NONPRINTABLE covers what
+    YAML additionally bans or folds; `$` doubles to `$$` because compose
+    interpolates every -f file it merges (the piped override included).
     """
-    return json.dumps(value, ensure_ascii=False).replace("$", "$$")
+    quoted = json.dumps(value, ensure_ascii=False).replace("$", "$$")
+    return _YAML_NONPRINTABLE.sub(lambda m: f"\\u{ord(m.group()):04x}", quoted)
+
+
+# ✦ Claude Code's managed-policy memory file on Linux: loaded for every session
+# and, being root-owned inside the container, beyond the agent's reach.
+PROMPT_TARGET = "/etc/claude-code/CLAUDE.md"
+PROMPT_CONFIG = "jail-prompt"
+
+
+def _prompt_lines(prompt: str) -> "tuple[list[str], list[str]]":
+    """✦ (claude service lines, top-level lines) mounting `prompt` as an inline config."""
+    service = ["    configs:",
+               f"      - source: {PROMPT_CONFIG}",
+               f"        target: {PROMPT_TARGET}"]
+    top = ["configs:", f"  {PROMPT_CONFIG}:", f"    content: {_yaml_scalar(prompt)}"]
+    return service, top
 
 
 def _bind_stanza(source: str, target: str, read_only: bool) -> "list[str]":
     """A docker compose bind-mount stanza, read-write unless `read_only`."""
     lines = [
         "      - type: bind",
-        f"        source: {_yaml_path(source)}",
-        f"        target: {_yaml_path(target)}",
+        f"        source: {_yaml_scalar(source)}",
+        f"        target: {_yaml_scalar(target)}",
     ]
     if read_only:
         lines.append("        read_only: true")
@@ -304,7 +325,7 @@ def _mask_dir_stanza(target: str) -> "list[str]":
     masks can't drift apart."""
     return [
         "      - type: volume",
-        f"        target: {_yaml_path(target)}",
+        f"        target: {_yaml_scalar(target)}",
         "        read_only: true",
         "        volume:",
         "          nocopy: true",
@@ -454,9 +475,10 @@ def seed_masked_configs(paths: "list[str]") -> None:
 
 def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
              isolation: "dict | None" = None,
-             service_lines: "list[str] | None" = None
+             service_lines: "list[str] | None" = None,
+             prompt: "str | None" = None
              ) -> "tuple[str, list[str]]":
-    """Build the docker compose volume override: a per-root bind + masks.
+    """Build the docker compose override: a per-root bind + masks, and the prompt.
 
     Each root binds read-write, or read-only when a `read_only` entry names the
     root itself. Returns (document, seeds). Side-effect-free: before launching a
@@ -472,7 +494,8 @@ def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
     extra keys like `masked`/`base` may ride along and are ignored.)
 
     ✦ `service_lines` are extra pre-indented `claude` service keys
-    (build_env.service_lines), placed ahead of the volumes.
+    (build_env.service_lines), placed ahead of the volumes. A non-empty
+    `prompt` is mounted read-only at PROMPT_TARGET as an inline compose config.
     """
     isolate_root = isolation["repo"] if isolation else None
     volumes: "list[str]" = []
@@ -497,10 +520,14 @@ def override(roots: "list[Root]", config_class: "tuple[str, str] | None",
             volumes += _vcs_git_masks(root)
     if isolation:
         volumes += _spool_bind(isolation["spool"])
-    service_lines = service_lines or []
+    service_lines = list(service_lines or [])
+    top_lines: "list[str]" = []
+    if prompt:
+        prompt_service, top_lines = _prompt_lines(prompt)
+        service_lines += prompt_service
     if not volumes and not service_lines:
         return "", []
     out: "list[str]" = ["services:", "  claude:", *service_lines]
     if volumes:
         out += ["    volumes:", *volumes]
-    return "\n".join(out) + "\n", seeds
+    return "\n".join(out + top_lines) + "\n", seeds

@@ -3,10 +3,6 @@ set -euo pipefail
 
 args=()
 
-if [ -n "${CLAUDE_APPEND_SYSTEM_PROMPT:-}" ]; then
-    args+=(--append-system-prompt "$CLAUDE_APPEND_SYSTEM_PROMPT")
-fi
-
 # With no claude args, resume the last session — unless the `new` command set
 # CLAUDE_JAIL_NEW_SESSION, which asks for a fresh session instead.
 if [ "$#" -eq 0 ] && [ -z "${CLAUDE_JAIL_NEW_SESSION:-}" ]; then

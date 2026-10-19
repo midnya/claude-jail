@@ -746,6 +746,20 @@ class MemLimitBuildTests(JailTestCase):
         self.assertNotIn("8g", override)
 
 
+class PromptBuildTests(JailTestCase):
+    """✦ build_jail mounts the prompt through the override, never the env."""
+
+    def test_prompt_in_override_not_env(self):
+        proj = self.tmpdir()
+        cfg = self.write(os.path.join(proj, ".claude-jail.json"),
+                         '{"user": "t", "system_prompts": "zebra-marker"}')
+        env, override, _s, _c = L.build_jail(None, cfg, None, self.tmpdir(),
+                                             store_must_exist=True)
+        self.assertIn("target: /etc/claude-code/CLAUDE.md", override)
+        self.assertIn("zebra-marker", override)
+        self.assertFalse(any("zebra-marker" in v for v in env.values()))
+
+
 class GhTokenBuildTests(JailTestCase):
     """✦ build_jail exports the token as JAIL_GH_TOKEN, pinned to "" when unset."""
 

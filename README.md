@@ -17,7 +17,7 @@ tl;dr: as of today, the potential blast radius is as large as the organization's
 
 Run Claude Code inside a locked-down Docker container.
 
-Requires Docker v23+ (I think?) and Compose v2 (the plugin invoked via `docker compose`, not the binary `docker-compose`).
+Requires Docker v23+ (I think?) and Compose v2.23.1+ (the plugin invoked via `docker compose`, not the binary `docker-compose`).
 Requires Python 3, with no other dependencies.
 Very git centric. I have no genuine experience with other VCS to check for correctness.
 
@@ -303,6 +303,10 @@ Available keys:
   - file: `"system_prompts": { "path": "CLAUDE_PROMPT.md" }`
   - list (segments joined with a blank line, in order):
     `"system_prompts": ["Prefer pnpm over npm.", { "path": "CLAUDE_PROMPT.md" }]`
+  - The merged prompt (built-in, config, then `--system-prompt*` flags) reaches the
+    jail as an inline compose config, mounted read-only at
+    `/etc/claude-code/CLAUDE.md` (Claude Code's managed memory file). There is no
+    environment variable for it.
 
 Notes:
 - `user` must be a bare word (a letter, then letters/digits/`-`/`_`).

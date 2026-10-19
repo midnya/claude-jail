@@ -29,8 +29,7 @@ no-symlink read, but — like an external `--config`'s prompt files, and unlike 
 in-jail config's own system_prompts.path — is trusted to live anywhere on the
 host (the operator supplies it, not the agent), so it is not confined to the
 roots. Calls die() on a malformed config, an unsafe path, a missing or empty
-prompt file, or a prompt segment containing a NUL byte (which cannot be placed in
-the environment).
+prompt file, or a prompt segment containing a NUL byte.
 """
 from pathlib import Path
 
@@ -116,9 +115,7 @@ def resolve_segment(value: "object", source: str, cfg_dir: str,
     config's setting-and-file (`'system_prompts' in <path>`) or a CLI flag (`a
     --system-prompt-file argument`) — so a rejection is attributed to what the
     user actually wrote, not the config key whose rules a CLI segment merely
-    reuses. Rejects a NUL byte: the merged prompt becomes the
-    CLAUDE_APPEND_SYSTEM_PROMPT environment variable, and os.environ cannot hold
-    an embedded NUL.
+    reuses. Rejects a NUL byte, which has no place in the prompt text.
     """
     if isinstance(value, str):
         if not value.strip():

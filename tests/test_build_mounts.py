@@ -1,4 +1,5 @@
 """Tests for build_mounts.py: the compose volume override builder."""
+import json
 import os
 from pathlib import Path
 from unittest import mock
@@ -109,15 +110,46 @@ class TreeResolveTests(JailTestCase):
                          [("a", "hidden"), ("b", "read_only")])
 
 
-class YamlPathTests(JailTestCase):
+class YamlScalarTests(JailTestCase):
     def test_plain_path_quoted(self):
-        self.assertEqual(bm._yaml_path("/a/b"), '"/a/b"')
+        self.assertEqual(bm._yaml_scalar("/a/b"), '"/a/b"')
 
     def test_dollar_doubled(self):
-        self.assertEqual(bm._yaml_path("/a/$x"), '"/a/$$x"')
+        self.assertEqual(bm._yaml_scalar("/a/$x"), '"/a/$$x"')
 
     def test_spaces_and_quotes_escaped(self):
-        self.assertEqual(bm._yaml_path('/a "b"/c'), '"/a \\"b\\"/c"')
+        self.assertEqual(bm._yaml_scalar('/a "b"/c'), '"/a \\"b\\"/c"')
+
+
+# ✦ The scalar's escapes are a subset of JSON's, so json.loads (after undoing
+# compose's `$$`) inverts it without a YAML parser.
+class YamlScalarSweepTests(JailTestCase):
+    TRICKY = ['plain', '', ' lead and trail ', 'quote " back \\ slash',
+              "single ' quote", 'line\nbreak\r\nand\ttab', '$HOME ${X} $$',
+              '# not a comment', 'key: value', '- dash', '*alias &anchor !tag',
+              '{flow: [seq]}', '\x00\x1b\x7f', '\x85\u2028\u2029',
+              '\ufeff\ufffe\uffff', 'é ü 中文 🙂 \U0010ffff']
+    EVERY_CODEPOINT = "".join(chr(c) for c in range(0x110000)
+                              if not 0xD800 <= c <= 0xDFFF)
+    # ✦ Raw, these are invalid in a YAML double-quoted scalar or folded to a space.
+    MUST_ESCAPE = set(map(chr, [*range(0x20), *range(0x7F, 0xA0),
+                                0x2028, 0x2029, 0xFFFE, 0xFFFF]))
+
+    def decode(self, scalar):
+        return json.loads(scalar.replace("$$", "$"))
+
+    def test_tricky_values_invert(self):
+        for value in self.TRICKY:
+            with self.subTest(value=value):
+                self.assertEqual(self.decode(bm._yaml_scalar(value)), value)
+
+    def test_every_codepoint_inverts(self):
+        scalar = bm._yaml_scalar(self.EVERY_CODEPOINT)
+        self.assertEqual(self.decode(scalar), self.EVERY_CODEPOINT)
+
+    def test_every_codepoint_escapes_yaml_hazards(self):
+        scalar = bm._yaml_scalar(self.EVERY_CODEPOINT)
+        self.assertEqual(sorted(self.MUST_ESCAPE.intersection(scalar)), [])
 
 
 class BindStanzaTests(JailTestCase):
@@ -146,8 +178,29 @@ class BindStanzaTests(JailTestCase):
         self.assertIn('        source: "/host/proj"', lines)
         self.assertIn("        read_only: true", lines)
 
+    def test_paths_escape_yaml_hazards(self):
+        lines = bm._bind_stanza("/s\x85\x7f", "/t\u2028\uffff", read_only=False)
+        self.assertIn('        source: "/s\\u0085\\u007f"', lines)
+        self.assertIn('        target: "/t\\u2028\\uffff"', lines)
+
+    def test_mask_dir_target_escapes_yaml_hazards(self):
+        lines = bm._mask_dir_stanza("/t\x85\u2029")
+        self.assertIn('        target: "/t\\u0085\\u2029"', lines)
+
 
 class MaskVolumesTests(JailTestCase):
+    def test_hazardous_names_escaped(self):
+        root = self.tmpdir()
+        self.write(os.path.join(root, "f\x85"), "x")
+        self.mkdir(os.path.join(root, "d\u2028"))
+        volumes, _ = bm._mask_volumes(
+            [("d\u2028", "hidden"), ("f\x85", "read_only")], root, set())
+        text = "\n".join(volumes)
+        self.assertIn(f'target: "/workspace{root}/d\\u2028"', text)
+        self.assertIn(f'source: "{root}/f\\u0085"', text)
+        self.assertNotIn("\x85", text)
+        self.assertNotIn("\u2028", text)
+
     def test_existing_read_only_file_bound(self):
         root = self.tmpdir()
         self.write(os.path.join(root, "cfg.yml"), "x")
@@ -310,6 +363,19 @@ class OverrideTests(JailTestCase):
     def test_service_lines_alone_yield_document(self):
         self.assertEqual(bm.override([], None, service_lines=["    mem_limit: 4g"]),
                          ("services:\n  claude:\n    mem_limit: 4g\n", []))
+
+    def test_prompt_mounted_as_inline_config(self):
+        document, _ = bm.override([], None, prompt="be $terse\nok")
+        self.assertEqual(document, (
+            "services:\n  claude:\n    configs:\n"
+            "      - source: jail-prompt\n"
+            "        target: /etc/claude-code/CLAUDE.md\n"
+            "configs:\n  jail-prompt:\n"
+            '    content: "be $$terse\\nok"\n'))
+
+    def test_prompt_escapes_yaml_nonprintable(self):
+        document, _ = bm.override([], None, prompt="a\x7fb\x85c\u2028d\u2029e")
+        self.assertIn('content: "a\\u007fb\\u0085c\\u2028d\\u2029e"', document)
 
     def test_git_default_read_only_skipped_when_absent(self):
         # .git is read_only by default; with no .git on disk it is just omitted.
